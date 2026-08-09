@@ -181,18 +181,37 @@ if "settings" not in st.session_state:
         "system_prompt": "You are a helpful, concise assistant.",
     }
 
-# ---------------------------------------------------------
-# Top bar: wordmark + settings popover + clear chat
-# ---------------------------------------------------------
-left, mid, right = st.columns([5, 1, 1.2])
 
-with left:
-    st.markdown('<div class="wordmark">groq<span>chat</span> ⚡</div>', unsafe_allow_html=True)
+# Top bar: wordmark + clear chat (Pinned)
+# ---------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    /* Pin the first block-container element to the top */
+    div[data-testid="stVerticalBlock"] > div:has(.wordmark) {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        background: #f7f5f2;
+        padding-top: 0.5rem;
+        padding-bottom: 0.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-with right:
-    if st.button("Clear", use_container_width=True, disabled=not st.session_state.messages):
-        clear_history()
-        st.rerun()
+top_bar = st.container()
+with top_bar:
+    left, mid, right = st.columns([5, 1, 1.2])
+
+    with left:
+        st.markdown('<div class="wordmark">groq<span>chat</span> ⚡</div>', unsafe_allow_html=True)
+
+    with right:
+        if st.button("Clear", use_container_width=True, disabled=not st.session_state.messages):
+            clear_history()
+            st.rerun()
 
 # ---------------------------------------------------------
 # Hero (only when there's no conversation yet)
@@ -266,7 +285,6 @@ if prompt:
 
         elapsed = max(time.time() - start, 0.001)
         tok_s = (len(full_response.split()) / elapsed) * 1.3  # rough tokens/sec estimate
-        st.markdown(f'<div class="speed-tag">{tok_s:.0f} tok/s</div>', unsafe_allow_html=True)
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response, "tok_s": tok_s})
+    st.session_state.messages.append({"role": "assistant", "content": full_response})
     save_history(st.session_state.messages)
