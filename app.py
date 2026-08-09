@@ -1,48 +1,48 @@
-import io
 import json
 import os
 import re
 import tempfile
 import threading
-import wave
+import asyncio
+from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
-
+import edge_tts
 
 # ---------------------------------------------------------
 # Page config
 # ---------------------------------------------------------
 st.set_page_config(
-    page_title="AI ChatBot",
+    page_title="Groq Chat",
+    page_icon="⚡",
     layout="centered",
 )
 
 load_dotenv()
-API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
 HISTORY_FILE = "chat_history.json"
 HISTORY_LOCK = threading.RLock()
 
+# ---------------------------------------------------------
+# Models / voice configuration
+# ---------------------------------------------------------
 CHAT_MODEL = "openai/gpt-oss-20b"
 TEMPERATURE = 0.7
 SYSTEM_PROMPT = "You are a helpful, concise assistant."
 
-STT_MODEL = "whisper-large-v3-turbo"
-
-TTS_EN_MODEL = "canopylabs/orpheus-v1-english"
-TTS_EN_VOICE = "hannah"
-
-TTS_AR_MODEL = "canopylabs/orpheus-arabic-saudi"
-TTS_AR_VOICE = "aisha"
-
+# Edge TTS voice configuration
+EDGE_TTS_EN_VOICE = "en-US-JennyNeural"
+EDGE_TTS_AR_VOICE = "ar-EG-SalmaNeural"
+MAX_TTS_CHARS = 3000
 
 # ---------------------------------------------------------
 # Shared chat history
 # ---------------------------------------------------------
 def _is_valid_history(data):
-    """Validate the JSON structure before using it as chat history."""
     if not isinstance(data, list):
         return False
 
@@ -58,7 +58,6 @@ def _is_valid_history(data):
 
 
 def load_history():
-    """Load the shared chat history safely."""
     with HISTORY_LOCK:
         if not os.path.exists(HISTORY_FILE):
             return []
@@ -68,13 +67,11 @@ def load_history():
                 data = json.load(file)
 
             return data if _is_valid_history(data) else []
-
         except (json.JSONDecodeError, OSError):
             return []
 
 
 def save_history(messages):
-    """Atomically save history so a partially-written JSON file is avoided."""
     with HISTORY_LOCK:
         directory = os.path.dirname(os.path.abspath(HISTORY_FILE)) or "."
         temp_path = None
@@ -92,9 +89,7 @@ def save_history(messages):
             os.replace(temp_path, HISTORY_FILE)
 
         except OSError as error:
-            st.warning("Your message was sent, but the chat history could not be saved.")
             print(f"History save error: {error}")
-
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
@@ -103,10 +98,6 @@ def save_history(messages):
 
 
 def append_message(role, content):
-    """
-    Reload before appending so different browser sessions/devices do not
-    overwrite each other's latest messages.
-    """
     with HISTORY_LOCK:
         messages = load_history()
         messages.append({"role": role, "content": content})
@@ -124,177 +115,66 @@ def clear_history():
 
 
 # ---------------------------------------------------------
-# Groq helpers
+# TTS Functions
 # ---------------------------------------------------------
-def get_client():
-    if not API_KEY:
-        raise RuntimeError("No GROQ_API_KEY was found.")
-    return Groq(api_key=API_KEY)
+def response_language(text):
+    arabic = len(re.findall(r"[\u0600-\u06FF]", text))
+    latin = len(re.findall(r"[A-Za-z]", text))
+    return "ar" if arabic > latin else "en"
 
 
-def transcribe(audio_file):
-    """
-    Send Streamlit's native recorded WAV file directly to Groq Whisper.
-    No Base64, query parameters, custom JavaScript, or page redirects.
-    """
-    audio_bytes = audio_file.getvalue()
-
-    if not audio_bytes:
-        return ""
-
-    filename = audio_file.name or "recording.wav"
-
-    result = get_client().audio.transcriptions.create(
-        file=(filename, audio_bytes),
-        model=STT_MODEL,
-        response_format="json",
-        temperature=0.0,
-    )
-
-    return (result.text or "").strip()
-
-
-def contains_mostly_arabic(text):
-    arabic_chars = sum("\u0600" <= char <= "\u06FF" for char in text)
-    letters = sum(char.isalpha() for char in text)
-
-    return letters > 0 and arabic_chars / letters >= 0.35
-
-
-def split_tts_text(text, max_chars=190):
-    """
-    Orpheus accepts short inputs, so long assistant responses are split
-    at sentence/word boundaries before generating audio.
-    """
-    text = re.sub(r"\s+", " ", text).strip()
-
+def generate_edge_tts_audio(text):
     if not text:
         return []
 
-    sentences = re.split(r"(?<=[.!?؟])\s+", text)
-    chunks = []
-    current = ""
+    text = re.sub(r"```.*?```", "code omitted", text, flags=re.DOTALL)
+    text = re.sub(r"\s+", " ", text).strip()
+    
+    if len(text) > MAX_TTS_CHARS:
+        text = text[:MAX_TTS_CHARS] + "..."
+    
+    if not text:
+        return []
 
-    for sentence in sentences:
-        sentence = sentence.strip()
-
-        if not sentence:
-            continue
-
-        if len(sentence) > max_chars:
-            words = sentence.split()
-
-            for word in words:
-                candidate = word if not current else f"{current} {word}"
-
-                if len(candidate) <= max_chars:
-                    current = candidate
-                else:
-                    if current:
-                        chunks.append(current)
-                    current = word
-
-            continue
-
-        candidate = sentence if not current else f"{current} {sentence}"
-
-        if len(candidate) <= max_chars:
-            current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            current = sentence
-
-    if current:
-        chunks.append(current)
-
-    return chunks
-
-
-def response_to_wav_bytes(response):
-    """Read Groq's WAV response into memory without keeping a permanent file."""
-    temp_path = None
+    lang = response_language(text)
+    voice = EDGE_TTS_AR_VOICE if lang == "ar" else EDGE_TTS_EN_VOICE
+    
+    output_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    output_path = output_file.name
+    output_file.close()
 
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".wav",
-            delete=False,
-        ) as temp_file:
-            temp_path = temp_file.name
-
-        response.write_to_file(temp_path)
-
-        with open(temp_path, "rb") as audio_file:
-            return audio_file.read()
-
+        async def generate_tts():
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(output_path)
+        
+        asyncio.run(generate_tts())
+        
+        with open(output_path, "rb") as f:
+            audio_bytes = f.read()
+        
+        if not audio_bytes:
+            raise RuntimeError("Edge TTS returned empty audio.")
+        
+        return [audio_bytes]
+        
+    except Exception as e:
+        print(f"Edge TTS error: {type(e).__name__}: {e}")
+        raise RuntimeError(f"TTS generation failed: {str(e)}")
     finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
+        try:
+            os.unlink(output_path)
+        except OSError:
+            pass
 
 
-def merge_wav_files(wav_files):
-    """Merge multiple WAV chunks into one playable WAV file."""
-    if not wav_files:
-        return None
-
-    if len(wav_files) == 1:
-        return wav_files[0]
-
-    output = io.BytesIO()
-
-    with wave.open(io.BytesIO(wav_files[0]), "rb") as first:
-        params = first.getparams()
-
-    with wave.open(output, "wb") as writer:
-        writer.setparams(params)
-
-        for wav_bytes in wav_files:
-            with wave.open(io.BytesIO(wav_bytes), "rb") as reader:
-                same_format = (
-                    reader.getnchannels() == params.nchannels
-                    and reader.getsampwidth() == params.sampwidth
-                    and reader.getframerate() == params.framerate
-                )
-
-                if not same_format:
-                    raise ValueError("TTS audio chunks have incompatible WAV formats.")
-
-                writer.writeframes(reader.readframes(reader.getnframes()))
-
-    return output.getvalue()
-
-
-def generate_tts_audio(text):
-    """Generate a single WAV file for an assistant response."""
-    clean_text = re.sub(r"```.*?```", "code omitted", text, flags=re.DOTALL)
-    clean_text = re.sub(r"\s+", " ", clean_text).strip()
-
-    if not clean_text:
-        return None
-
-    if contains_mostly_arabic(clean_text):
-        model = TTS_AR_MODEL
-        voice = TTS_AR_VOICE
-    else:
-        model = TTS_EN_MODEL
-        voice = TTS_EN_VOICE
-
-    wav_chunks = []
-
-    for chunk in split_tts_text(clean_text):
-        response = get_client().audio.speech.create(
-            model=model,
-            voice=voice,
-            input=chunk,
-            response_format="wav",
-        )
-
-        wav_chunks.append(response_to_wav_bytes(response))
-
-    return merge_wav_files(wav_chunks)
+# ---------------------------------------------------------
+# Get Groq client
+# ---------------------------------------------------------
+def get_groq_client():
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured.")
+    return Groq(api_key=GROQ_API_KEY)
 
 
 # ---------------------------------------------------------
@@ -326,7 +206,6 @@ st.markdown(
         padding-bottom: 7rem;
     }
 
-    /* ---- top bar ---- */
     .wordmark {
         font-family: 'Space Grotesk', sans-serif;
         font-weight: 700;
@@ -340,7 +219,6 @@ st.markdown(
         color: #ff4d1c;
     }
 
-    /* ---- hero ---- */
     .hero {
         text-align: center;
         padding: 4.5rem 0 2rem 0;
@@ -372,7 +250,6 @@ st.markdown(
         margin-top: -0.5rem;
     }
 
-    /* ---- chat messages ---- */
     div[data-testid="stChatMessage"] {
         background: transparent;
         padding: 0.3rem 0;
@@ -386,7 +263,6 @@ st.markdown(
         box-shadow: 0 1px 2px rgba(25, 24, 22, 0.03);
     }
 
-    /* ---- buttons outside the chat input ---- */
     .stButton > button {
         background: #ffffff;
         border: 1px solid #e7e3dc;
@@ -401,13 +277,6 @@ st.markdown(
         color: #ff4d1c;
     }
 
-    /*
-    IMPORTANT:
-    Do not style every button inside stChatInput.
-    Streamlit's native audio-enabled chat input has separate microphone
-    and send controls. Keeping those controls native preserves the layout
-    shown in the reference image.
-    */
     div[data-testid="stChatInput"] {
         background: #ffffff;
         border: 1px solid #e7e3dc;
@@ -424,7 +293,10 @@ st.markdown(
         color: #a8a39a !important;
     }
 
-    /* Keep Streamlit's bottom wrappers visually clean. */
+    div[data-testid="stChatInput"] button {
+        border-radius: 50%;
+    }
+
     div[data-testid="stBottom"],
     div[data-testid="stBottom"] > div,
     div[data-testid="stBottomBlockContainer"],
@@ -435,7 +307,6 @@ st.markdown(
         border: none !important;
     }
 
-    /* ---- sticky top bar ---- */
     div[data-testid="stVerticalBlock"] > div:has(.wordmark) {
         position: sticky;
         top: 0;
@@ -445,7 +316,10 @@ st.markdown(
         padding-bottom: 0.5rem;
     }
 
-    /* ---- mobile ---- */
+    div[data-testid="stAudio"] {
+        margin-top: 0.5rem;
+    }
+
     @media (max-width: 640px) {
         .block-container {
             padding-left: 1rem;
@@ -481,13 +355,18 @@ with top_bar:
         )
 
     with right:
-        if st.button("Clear", use_container_width=True):
+        messages_for_button = load_history()
+        if st.button(
+            "Clear",
+            use_container_width=True,
+            disabled=not messages_for_button,
+        ):
             clear_history()
             st.rerun()
 
 
 # ---------------------------------------------------------
-# Shared history
+# History
 # ---------------------------------------------------------
 messages = load_history()
 
@@ -500,16 +379,18 @@ if not messages:
         """
         <div class="hero">
             <h1>Ask at the <span class="accent">speed</span><br>of thought</h1>
-            <p>Groq-powered chat with native voice input and voice responses</p>
+            <p>Groq-powered chat with Chrome Web Speech API STT and Edge TTS</p>
+            <p style="font-size:0.85rem; color:#a8a39a; margin-top:0.5rem;">
+                🎤 Click the microphone to speak • 💬 Type to text
+            </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if not API_KEY:
+    if not GROQ_API_KEY:
         st.markdown(
-            '<p class="no-key-note">No GROQ_API_KEY found — add it to a .env file '
-            "in this folder to enable chat, STT, and TTS.</p>",
+            '<p class="no-key-note">⚠️ Missing GROQ_API_KEY in .env file</p>',
             unsafe_allow_html=True,
         )
 
@@ -523,56 +404,143 @@ for message in messages:
 
 
 # ---------------------------------------------------------
-# Native chat input with built-in microphone
+# Web Speech API Override - Intercept microphone button
+# ---------------------------------------------------------
+# This iframe injects JavaScript that intercepts the microphone button click
+# and uses Chrome's Web Speech API instead of Streamlit's built-in recording
+st.iframe("""
+<!DOCTYPE html>
+<html>
+<head>
+<script>
+(function() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+    
+    let recognition = null;
+    let isListening = false;
+    
+    // Function to find and hook the microphone button
+    function hookMicrophone() {
+        const micBtn = document.querySelector('button[data-testid="stChatInput"] button:first-child');
+        if (micBtn && !micBtn.dataset.speechHooked) {
+            micBtn.dataset.speechHooked = 'true';
+            
+            micBtn.addEventListener('click', function(e) {
+                // Only intercept if it's the mic button (has SVG)
+                if (this.querySelector('svg')) {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    
+                    if (!recognition) {
+                        recognition = new SpeechRecognition();
+                        recognition.lang = 'en-US';
+                        recognition.continuous = false;
+                        recognition.interimResults = true;
+                        
+                        recognition.onstart = function() {
+                            isListening = true;
+                            micBtn.style.color = '#dc3545';
+                            micBtn.style.animation = 'pulse 1s infinite';
+                        };
+                        
+                        recognition.onresult = function(event) {
+                            let finalTranscript = '';
+                            for (let i = event.resultIndex; i < event.results.length; i++) {
+                                if (event.results[i].isFinal) {
+                                    finalTranscript += event.results[i][0].transcript;
+                                }
+                            }
+                            if (finalTranscript) {
+                                const input = document.querySelector('input[data-testid="stChatInput"]');
+                                if (input) {
+                                    input.value = finalTranscript;
+                                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                                    // Click send
+                                    const sendBtn = document.querySelector('button[data-testid="stChatInput"] button:last-child');
+                                    if (sendBtn) setTimeout(() => sendBtn.click(), 100);
+                                }
+                            }
+                        };
+                        
+                        recognition.onerror = function() { stopListening(); };
+                        recognition.onend = function() { stopListening(); };
+                        
+                        // Add pulse style
+                        const style = document.createElement('style');
+                        style.textContent = '@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }';
+                        document.head.appendChild(style);
+                    }
+                    
+                    if (isListening) {
+                        recognition.stop();
+                        stopListening();
+                    } else {
+                        try { recognition.start(); } catch(e) {}
+                    }
+                    
+                    function stopListening() {
+                        isListening = false;
+                        micBtn.style.color = '';
+                        micBtn.style.animation = 'none';
+                        if (recognition) try { recognition.stop(); } catch(e) {}
+                    }
+                }
+            });
+        }
+    }
+    
+    // Wait for Streamlit to fully load
+    const observer = new MutationObserver(() => {
+        hookMicrophone();
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    
+    // Also try immediately in case it's already loaded
+    setTimeout(hookMicrophone, 500);
+})();
+</script>
+</head>
+<body>
+</body>
+</html>
+""", width=1, height=1)
+
+
+# ---------------------------------------------------------
+# Native Streamlit chat input
 # ---------------------------------------------------------
 submission = st.chat_input(
     "Ask anything",
     accept_audio=True,
     audio_sample_rate=16000,
-    key="chat_input",
+    key="main_chat_input",  # <--- UNIQUE KEY ADDED HERE
 )
 
+
+# ---------------------------------------------------------
+# Process input
+# ---------------------------------------------------------
 prompt = ""
 
 if submission:
-    typed_text = (submission.text or "").strip()
-    recorded_audio = submission.audio
-
-    if recorded_audio is not None:
-        if not API_KEY:
-            st.error("No Groq API key configured. Add GROQ_API_KEY to your .env file.")
-        else:
-            with st.spinner("Transcribing your voice..."):
-                try:
-                    transcript = transcribe(recorded_audio)
-                except Exception as error:
-                    transcript = ""
-                    st.error(
-                        "I couldn't transcribe that recording. "
-                        "Please check your microphone/API key and try again."
-                    )
-                    print(f"STT error: {error}")
-
-            if transcript:
-                prompt = transcript if not typed_text else f"{typed_text}\n\n{transcript}"
-            elif typed_text:
-                prompt = typed_text
-
+    # Extract text from ChatInputValue object
+    if hasattr(submission, 'text'):
+        prompt = submission.text or ""
     else:
-        prompt = typed_text
+        prompt = str(submission) if submission else ""
 
 
 # ---------------------------------------------------------
 # Generate assistant response
 # ---------------------------------------------------------
 if prompt:
-    if not API_KEY:
-        st.error(
-            "No Groq API key configured. Add GROQ_API_KEY to a .env file in this folder."
-        )
+    if not GROQ_API_KEY:
+        st.error("No GROQ_API_KEY configured in your .env file.")
         st.stop()
 
-    # Save the user's message first, so it is not lost if the API fails.
+    # Save the user message
     messages = append_message("user", prompt)
 
     with st.chat_message("user"):
@@ -593,7 +561,8 @@ if prompt:
         placeholder = st.empty()
 
         try:
-            stream = get_client().chat.completions.create(
+            client = get_groq_client()
+            stream = client.chat.completions.create(
                 model=CHAT_MODEL,
                 messages=api_messages,
                 temperature=TEMPERATURE,
@@ -605,7 +574,6 @@ if prompt:
                     continue
 
                 delta = chunk.choices[0].delta.content or ""
-
                 if delta:
                     full_response += delta
                     placeholder.markdown(full_response + "▌")
@@ -620,26 +588,25 @@ if prompt:
 
         except Exception as error:
             placeholder.empty()
-            st.error("The AI response failed. Please try again.")
-            print(f"Chat API error: {error}")
+            st.error(f"AI Response failed: {str(error)}")
+            print(f"Groq chat error: {type(error).__name__}: {error}")
+            
+            # Show the prompt that was sent for debugging
+            with st.expander("🔍 Debug Info"):
+                st.write("**Prompt sent to AI:**")
+                st.code(prompt)
+                st.write("**Messages sent:**")
+                st.json(api_messages)
 
-        # Only save a real assistant response, never an API error.
         if response_succeeded:
             append_message("assistant", full_response)
 
-            # Generate and autoplay TTS for the new answer.
-            with st.spinner("Generating voice response..."):
-                try:
-                    tts_audio = generate_tts_audio(full_response)
-
-                    if tts_audio:
-                        st.audio(
-                            tts_audio,
-                            format="audio/wav",
-                            autoplay=True,
-                        )
-
-                except Exception as error:
-                    # The text response still works even if TTS fails.
-                    print(f"TTS error: {error}")
-                    st.caption("Voice playback is temporarily unavailable.")
+            # Generate voice response
+            try:
+                audio_chunks = generate_edge_tts_audio(full_response)
+                for index, audio in enumerate(audio_chunks):
+                    st.audio(audio, format="audio/mp3", autoplay=(index == 0))
+                st.caption("🔊 Voice response (Edge TTS - Free)")
+            except Exception as error:
+                print(f"TTS error: {type(error).__name__}: {error}")
+                st.info("💬 Voice generation unavailable, but text response is above.")

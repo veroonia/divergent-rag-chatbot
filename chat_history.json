@@ -1,18 +1,22 @@
 [
   {
     "role": "user",
-    "content": "What is the current?"
-  },
-  {
-    "role": "assistant",
-    "content": "Current (in physics) is the rate at which electric charge flows through a conductor, measured in amperes (A). It’s defined as I = ΔQ/Δt, where ΔQ is the charge passing a point in time Δt. If you meant something else—like “the current time” or a different context—just let me know!"
+    "content": "hey"
   },
   {
     "role": "user",
-    "content": "what the capital of Egypt"
+    "content": "hey"
   },
   {
     "role": "assistant",
-    "content": "The capital of Egypt is Cairo."
+    "content": "Hey there! How can I help you today?"
+  },
+  {
+    "role": "user",
+    "content": "what is the capital of egypt"
+  },
+  {
+    "role": "assistant",
+    "content": "The capital of Egypt is **Cairo**."
   }
 ]
