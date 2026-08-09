@@ -1,3 +1,6 @@
 streamlit
 python-dotenv
 groq
+gTTS
+audio-recorder-streamlit
+streamlit-mic-recorder
