@@ -80,7 +80,7 @@ def text_to_speech(text: str) -> bytes:
 
 def main():
     st.set_page_config(
-        page_title="Groq AI Voice Chatbot",
+        page_title="AI Chatbot",
         page_icon="🤖",
         layout="wide",
     )
@@ -116,7 +116,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    st.title("🤖 Groq AI Voice Chatbot")
+    st.title("AI Chatbot")
 
     # Sidebar options
     with st.sidebar:
