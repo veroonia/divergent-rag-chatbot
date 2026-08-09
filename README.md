@@ -1,6 +1,6 @@
 # Simple Chatbot (Streamlit)
 
-A ChatGPT-style chatbot built with Streamlit and Google's Gemini API.
+A ChatGPT-style chatbot built with Streamlit and Groq's API.
 
 ## Installation
 
@@ -12,15 +12,15 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Configure Gemini
+## Configure Groq
 
 Create a `.env` file in the project root:
 
 ```text
-GEMINI_API_KEY=your_api_key_here
+GROQ_API_KEY=your_api_key_here
 ```
 
-Replace `your_api_key_here` with your Gemini API key.
+Replace `your_api_key_here` with your Groq API key.
 
 ## Run the application
 
@@ -32,7 +32,7 @@ streamlit run app.py
 
 - ChatGPT-style interface
 - Conversation history
-- Uses the official Google Gemini API
+- Uses the official Groq API
 - Secure API key using `.env`
 
 ## Project Structure

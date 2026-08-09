@@ -1,216 +1,256 @@
 import os
-import io
-import json
-import base64
-from dotenv import load_dotenv
+import time
 import streamlit as st
-import streamlit.components.v1 as components
+from dotenv import load_dotenv
 from groq import Groq
-from gtts import gTTS
-from streamlit_mic_recorder import speech_to_text
 
-# Load environment variables
+# ---------------------------------------------------------
+# Page config
+# ---------------------------------------------------------
+st.set_page_config(page_title="Groq Chat", page_icon="⚡", layout="centered")
+
 load_dotenv()
+API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
-# Get API key
-api_key = os.getenv("GROQ_API_KEY")
+# --------------------------------
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap');
 
-if not api_key:
-    st.error("GROQ_API_KEY not found in .env file.")
-    st.stop()
+    #MainMenu, footer, header {visibility: hidden;}
+    div[data-testid="stToolbar"] {display: none;}
+    div[data-testid="stDecoration"] {display: none;}
 
-# Create Groq client
-client = Groq(api_key=api_key)
+    .stApp {
+        background: #f7f5f2;
+        font-family: 'Inter', sans-serif;
+        color: #191816;
+    }
 
-# File to store shared chat history
-CHAT_FILE = "chat_history.json"
+    .block-container {
+        padding-top: 2rem;
+        max-width: 720px;
+    }
 
+    /* ---- top bar ---- */
+    .wordmark {
+        font-family: 'Space Grotesk', sans-serif;
+        font-weight: 700;
+        font-size: 1.15rem;
+        letter-spacing: -0.01em;
+        color: #191816;
+        padding-top: 0.5rem;
+    }
+    .wordmark span { color: #ff4d1c; }
 
-def load_messages():
-    """Load chat history from file."""
-    if not os.path.exists(CHAT_FILE):
-        return []
+    /* ---- hero (empty state) ---- */
+    .hero { text-align: center; padding: 4.5rem 0 2rem 0; }
+    .hero h1 {
+        font-family: 'Space Grotesk', sans-serif;
+        font-weight: 700;
+        font-size: 2.7rem;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
+        margin-bottom: 0.7rem;
+        color: #191816;
+    }
+    .hero h1 .accent { color: #ff4d1c; }
+    .hero p {
+        color: #706c66;
+        font-size: 1.02rem;
+    }
 
-    try:
-        with open(CHAT_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        return []
+    /* ---- chat bubbles ---- */
+    div[data-testid="stChatMessage"] {
+        background: transparent;
+        padding: 0.3rem 0;
+    }
+    div[data-testid="stChatMessageAvatarUser"] {
+        background: #191816 !important;
+    }
+    div[data-testid="stChatMessageAvatarAssistant"] {
+        background: #ff4d1c !important;
+    }
+    div[data-testid="stChatMessageContent"] {
+        background: #ffffff;
+        border: 1px solid #e7e3dc;
+        border-radius: 14px;
+        padding: 0.75rem 1.1rem;
+        box-shadow: 0 1px 2px rgba(25, 24, 22, 0.03);
+    }
 
+    .speed-tag {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.72rem;
+        color: #ff4d1c;
+        opacity: 0.85;
+        margin-top: 0.2rem;
+        padding-left: 0.2rem;
+    }
 
-def save_messages(messages):
-    """Save chat history to file."""
-    with open(CHAT_FILE, "w", encoding="utf-8") as f:
-        json.dump(messages, f, indent=4, ensure_ascii=False)
+    /* ---- chat input pill ---- */
+    div[data-testid="stChatInput"] {
+        background: #ffffff;
+        border: 1px solid #e7e3dc;
+        border-radius: 999px;
+        box-shadow: 0 8px 24px -14px rgba(25, 24, 22, 0.25);
+    }
+    div[data-testid="stChatInput"] textarea {
+        background: transparent !important;
+        color: #191816 !important;
+        padding: 0.85rem 1.2rem !important;
+    }
+    div[data-testid="stChatInput"] textarea::placeholder {
+        color: #a8a39a !important;
+    }
+    div[data-testid="stChatInput"] button {
+        background: #ff4d1c !important;
+        border-radius: 50% !important;
+    }
+    div[data-testid="stChatInput"] button svg {
+        fill: #ffffff !important;
+    }
 
+    /* ---- header buttons ---- */
+    .stButton button, div[data-testid="stPopover"] button {
+        background: #ffffff;
+        border: 1px solid #e7e3dc;
+        color: #706c66;
+        border-radius: 999px;
+        padding: 0.35rem 1rem;
+        font-size: 0.85rem;
+    }
+    .stButton button:hover, div[data-testid="stPopover"] button:hover {
+        border-color: #ff4d1c;
+        color: #ff4d1c;
+    }
 
-def get_response(prompt: str, model_name: str = "openai/gpt-oss-20b") -> str:
-    """Send prompt to Groq model."""
-    try:
-        completion = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-            temperature=0.7,
-            max_tokens=2048,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"Error: {e}"
+    .no-key-note {
+        text-align: center;
+        color: #a8a39a;
+        font-size: 0.85rem;
+        margin-top: -0.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
+# ---------------------------------------------------------
+# State
+# ---------------------------------------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "settings" not in st.session_state:
+    st.session_state.settings = {
+        "model": "openai/gpt-oss-20b",
+        "temperature": 0.7,
+        "system_prompt": "You are a helpful, concise assistant.",
+    }
 
-def text_to_speech(text: str) -> bytes:
-    """Convert text to speech MP3 bytes using gTTS."""
-    try:
-        # Clean markdown formatting before speaking
-        clean_text = text.replace("*", "").replace("#", "").replace("`", "")
-        tts = gTTS(text=clean_text, lang="en")
-        fp = io.BytesIO()
-        tts.write_to_fp(fp)
-        fp.seek(0)
-        return fp.read()
-    except Exception as e:
-        st.error(f"Text-to-Speech Error: {e}")
-        return None
+# ---------------------------------------------------------
+# Top bar: wordmark + settings popover + clear chat
+# ---------------------------------------------------------
+left, mid, right = st.columns([5, 1, 1.2])
 
+with left:
+    st.markdown('<div class="wordmark">groq<span>chat</span> ⚡</div>', unsafe_allow_html=True)
 
-def main():
-    st.set_page_config(
-        page_title="AI Chatbot",
-        page_icon="🤖",
-        layout="wide",
-    )
+with right:
+    if st.button("Clear", use_container_width=True, disabled=not st.session_state.messages):
+        st.session_state.messages = []
+        st.rerun()
 
-    # Custom CSS to ensure bottom mic + input bar remains fixed at the bottom throughout the chat
+# ---------------------------------------------------------
+# Hero (only when there's no conversation yet)
+# ---------------------------------------------------------
+if not st.session_state.messages:
     st.markdown(
         """
-        <style>
-        /* Fix bottom container (mic + chat input) to viewport bottom */
-        div[data-testid="stHorizontalBlock"]:has(iframe[title*="speech_to_text"]) {
-            position: fixed;
-            bottom: 0px;
-            left: 0px;
-            right: 0px;
-            background: #ffffff;
-            padding: 12px 3rem 16px 3rem;
-            z-index: 99999;
-            box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.08);
-            border-top: 1px solid #f0f2f6;
-        }
-        /* Ensure sidebar open space styling */
-        @media (min-width: 992px) {
-            section[data-testid="stSidebar"][aria-expanded="true"] + section div[data-testid="stHorizontalBlock"]:has(iframe[title*="speech_to_text"]) {
-                left: 18rem;
-            }
-        }
-        /* Add bottom margin to scroll container so chat messages are never covered */
-        .main .block-container {
-            padding-bottom: 110px !important;
-        }
-        </style>
+        <div class="hero">
+            <h1>Ask at the <span class="accent">speed</span><br>of thought</h1>
+            <p>Groq's LPU inference — answers as fast as you can read them</p>
+        </div>
         """,
         unsafe_allow_html=True,
     )
-
-    st.title("AI Chatbot")
-
-    # Sidebar options
-    with st.sidebar:
-        st.header("⚙️ Options")
-
-        st.subheader("🧠 Model Selection")
-        model_options = {
-            "OpenAI GPT-OSS 20B (Default)": "openai/gpt-oss-20b",
-            "Meta Llama 3.3 70B": "llama-3.3-70b-versatile",
-            "DeepSeek R1 70B (Advanced Reasoning)": "deepseek-r1-distill-llama-70b",
-            "Meta Llama 3.1 8B (Ultra Fast)": "llama-3.1-8b-instant",
-            "Mixtral 8x7B": "mixtral-8x7b-32768",
-        }
-        selected_model_name = st.selectbox(
-            "Choose AI Model:",
-            options=list(model_options.keys()),
-            index=0,
-        )
-        selected_model_id = model_options[selected_model_name]
-
-        st.markdown("---")
-        enable_tts = st.checkbox("🔊 Auto-Play Audio Speech", value=True)
-
-        st.markdown("---")
-        if st.button("🗑️ Clear Chat"):
-            save_messages([])
-            st.rerun()
-
-    # Load shared chat history
-    messages = load_messages()
-
-    # Display text messages ONLY
-    for msg in messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    prompt = None
-
-    # Bottom Input Layout (Web Speech API Mic button + Chat Input side by side)
-    col_mic, col_input = st.columns([1.8, 14], vertical_alignment="center")
-
-    with col_mic:
-        web_speech_text = speech_to_text(
-            language="en",
-            start_prompt="🎤 Speak",
-            stop_prompt="🛑 Listening...",
-            just_once=True,
-            use_container_width=True,
-            key="web_speech_stt",
+    if not API_KEY:
+        st.markdown(
+            '<p class="no-key-note">No GROQ_API_KEY found — add it to a .env file '
+            "in this folder to enable responses.</p>",
+            unsafe_allow_html=True,
         )
 
-    with col_input:
-        text_prompt = st.chat_input("Ask me anything or click microphone to speak...")
+# ---------------------------------------------------------
+# Render history
+# ---------------------------------------------------------
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant" and "tok_s" in msg:
+            st.markdown(f'<div class="speed-tag">{msg["tok_s"]:.0f} tok/s</div>', unsafe_allow_html=True)
 
-    # Handle Web Speech API Voice Input
-    if web_speech_text and web_speech_text.strip():
-        prompt = web_speech_text.strip()
+# ---------------------------------------------------------
+# Input + streaming response
+# ---------------------------------------------------------
+prompt = st.chat_input("Ask anything")
 
-    # Handle Text Input
-    if text_prompt:
-        prompt = text_prompt
+if prompt:
+    if not API_KEY:
+        st.error("No Groq API key configured. Add GROQ_API_KEY to a .env file in this folder.")
+        st.stop()
+    if not API_KEY.startswith("gsk_"):
+        st.error("GROQ_API_KEY format looks invalid. It should start with 'gsk_'.")
+        st.stop()
 
-    # Process prompt if available
-    if prompt:
-        # Save and display user message
-        messages.append({"role": "user", "content": prompt})
+    settings = st.session_state.settings
 
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-        # Generate response from Groq
-        with st.chat_message("assistant"):
-            with st.spinner(f"Thinking with {selected_model_name}... 🤖"):
-                reply = get_response(prompt, selected_model_id)
-                st.markdown(reply)
+    api_messages = [{"role": "system", "content": settings["system_prompt"]}] + [
+        {"role": m["role"], "content": m["content"]} for m in st.session_state.messages
+    ]
 
-                # Automatically play audio response invisibly (No visible player controls)
-                if enable_tts:
-                    with st.spinner("Generating voice audio... 🔊"):
-                        speech_bytes = text_to_speech(reply)
-                        if speech_bytes:
-                            audio_b64 = base64.b64encode(speech_bytes).decode("utf-8")
-                            autoplay_html = f"""
-                            <audio autoplay style="display:none;">
-                                <source src="data:audio/mp3;base64,{audio_b64}" type="audio/mp3">
-                            </audio>
-                            """
-                            components.html(autoplay_html, height=0)
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        full_response = ""
+        ok = False
+        start = time.time()
+        try:
+            client = Groq(api_key=API_KEY)
+            stream = client.chat.completions.create(
+                model=settings["model"],
+                messages=api_messages,
+                temperature=settings["temperature"],
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                full_response += delta
+                placeholder.markdown(full_response + "▌")
+            placeholder.markdown(full_response)
+            ok = True
+        except Exception as e:
+            msg = str(e)
+            if "invalid_api_key" in msg or "Invalid API Key" in msg:
+                full_response = (
+                    "⚠️ Invalid Groq API key. Update GROQ_API_KEY in your .env file "
+                    "with a valid key from console.groq.com, then restart Streamlit."
+                )
+            else:
+                full_response = f"⚠️ Error: {msg}"
+            placeholder.markdown(full_response)
 
-        # Save assistant text message to chat history and refresh
-        messages.append({"role": "assistant", "content": reply})
-        save_messages(messages)
-        st.rerun()
+        tok_s = None
+        if ok:
+            elapsed = max(time.time() - start, 0.001)
+            tok_s = (len(full_response.split()) / elapsed) * 1.3  # rough tokens/sec estimate
+            st.markdown(f'<div class="speed-tag">{tok_s:.0f} tok/s</div>', unsafe_allow_html=True)
 
-
-if __name__ == "__main__":
-    main()
+    assistant_msg = {"role": "assistant", "content": full_response}
+    if tok_s is not None:
+        assistant_msg["tok_s"] = tok_s
+    st.session_state.messages.append(assistant_msg)

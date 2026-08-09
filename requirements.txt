@@ -1,6 +1,3 @@
-streamlit
-python-dotenv
-groq
-gTTS
-audio-recorder-streamlit
-streamlit-mic-recorder
+streamlit>=1.36
+groq>=0.9.0
+python-dotenv>=1.0
