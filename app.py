@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import streamlit as st
@@ -10,9 +11,40 @@ from groq import Groq
 st.set_page_config(page_title="Groq Chat", page_icon="⚡", layout="centered")
 
 load_dotenv()
-API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# --------------------------------
+# ---------------------------------------------------------
+# Chat history persistence
+# ---------------------------------------------------------
+HISTORY_FILE = "chat_history.json"
+
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return []
+    return []
+
+
+def save_history(messages):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(messages, f, indent=2)
+    except OSError:
+        pass
+
+
+def clear_history():
+    st.session_state.messages = []
+    if os.path.exists(HISTORY_FILE):
+        try:
+            os.remove(HISTORY_FILE)
+        except OSError:
+            pass
+
 st.markdown(
     """
     <style>
@@ -141,10 +173,10 @@ st.markdown(
 # State
 # ---------------------------------------------------------
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = load_history()
 if "settings" not in st.session_state:
     st.session_state.settings = {
-        "model": "openai/gpt-oss-20b",
+        "model": "llama-3.3-70b-versatile",
         "temperature": 0.7,
         "system_prompt": "You are a helpful, concise assistant.",
     }
@@ -159,7 +191,7 @@ with left:
 
 with right:
     if st.button("Clear", use_container_width=True, disabled=not st.session_state.messages):
-        st.session_state.messages = []
+        clear_history()
         st.rerun()
 
 # ---------------------------------------------------------
@@ -200,9 +232,6 @@ if prompt:
     if not API_KEY:
         st.error("No Groq API key configured. Add GROQ_API_KEY to a .env file in this folder.")
         st.stop()
-    if not API_KEY.startswith("gsk_"):
-        st.error("GROQ_API_KEY format looks invalid. It should start with 'gsk_'.")
-        st.stop()
 
     settings = st.session_state.settings
 
@@ -217,7 +246,6 @@ if prompt:
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_response = ""
-        ok = False
         start = time.time()
         try:
             client = Groq(api_key=API_KEY)
@@ -232,25 +260,13 @@ if prompt:
                 full_response += delta
                 placeholder.markdown(full_response + "▌")
             placeholder.markdown(full_response)
-            ok = True
         except Exception as e:
-            msg = str(e)
-            if "invalid_api_key" in msg or "Invalid API Key" in msg:
-                full_response = (
-                    "⚠️ Invalid Groq API key. Update GROQ_API_KEY in your .env file "
-                    "with a valid key from console.groq.com, then restart Streamlit."
-                )
-            else:
-                full_response = f"⚠️ Error: {msg}"
+            full_response = f"⚠️ Error: {e}"
             placeholder.markdown(full_response)
 
-        tok_s = None
-        if ok:
-            elapsed = max(time.time() - start, 0.001)
-            tok_s = (len(full_response.split()) / elapsed) * 1.3  # rough tokens/sec estimate
-            st.markdown(f'<div class="speed-tag">{tok_s:.0f} tok/s</div>', unsafe_allow_html=True)
+        elapsed = max(time.time() - start, 0.001)
+        tok_s = (len(full_response.split()) / elapsed) * 1.3  # rough tokens/sec estimate
+        st.markdown(f'<div class="speed-tag">{tok_s:.0f} tok/s</div>', unsafe_allow_html=True)
 
-    assistant_msg = {"role": "assistant", "content": full_response}
-    if tok_s is not None:
-        assistant_msg["tok_s"] = tok_s
-    st.session_state.messages.append(assistant_msg)
+    st.session_state.messages.append({"role": "assistant", "content": full_response, "tok_s": tok_s})
+    save_history(st.session_state.messages)
