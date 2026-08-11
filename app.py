@@ -6,17 +6,16 @@ import asyncio
 from datetime import datetime
 from pathlib import Path
 
+from rag_retriever import get_relevant_context
+
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
-from ui_fragments import (
+from html_utils import (
     close_assistant_row,
     open_assistant_row,
-    render_hero,
     render_message_actions,
-    render_missing_key_note,
     render_user_message,
-    render_wordmark,
 )
 # TTS disabled for now — uncomment when re-enabling Edge TTS voice responses
 # import edge_tts
@@ -42,7 +41,31 @@ HISTORY_LOCK = threading.RLock()
 # ---------------------------------------------------------
 CHAT_MODEL = "openai/gpt-oss-20b"
 TEMPERATURE = 0.7
-SYSTEM_PROMPT = "You are a helpful, concise assistant."
+SYSTEM_PROMPT = """
+You are a helpful, accurate, and concise AI assistant.
+
+You can answer two types of questions:
+
+1. General questions:
+Answer using your general knowledge.
+
+2. Questions about the user's documents:
+Use the provided document context as the primary source.
+
+Rules:
+
+- If the question is general knowledge and unrelated to the documents,
+  answer normally.
+- If the question asks about the documents, rely only on the retrieved
+  document context.
+- Never invent or hallucinate information from the documents.
+- Never claim something is in the documents unless the provided context
+  supports it.
+- If the retrieved context does not contain enough information to answer
+  a document-specific question, explicitly say so.
+- Do not force document context into unrelated questions.
+- Be clear, concise, and accurate.
+"""
 
 # Edge TTS voice configuration (disabled for now)
 # EDGE_TTS_EN_VOICE = "en-US-JennyNeural"
@@ -198,6 +221,25 @@ def load_css() -> None:
     css_path = Path(__file__).with_name("styles").joinpath("app.css")
     st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
 
+# ---------------------------------------------------------
+# Hero / UI components
+# ---------------------------------------------------------
+def render_hero():
+    return """
+    <div class="hero">
+        <h1>How can I help you?</h1>
+        <p>Ask me anything about your documents.</p>
+    </div>
+    """
+
+
+def render_missing_key_note():
+    return """
+    <div class="missing-key-note">
+        <strong>Groq API key not configured.</strong>
+        <p>Add your GROQ_API_KEY to the .env file to start chatting.</p>
+    </div>
+    """
 
 # Styling
 # ---------------------------------------------------------
@@ -214,7 +256,11 @@ with top_bar:
     left, spacer, right = st.columns([5, 1, 1.2])
 
     with left:
-        st.markdown(render_wordmark(), unsafe_allow_html=True)
+                st.markdown("""
+        <div class="wordmark">
+            Your Chatbot
+        </div>
+        """, unsafe_allow_html=True)
 
     with right:
         messages_for_button = load_history()
@@ -384,12 +430,51 @@ if prompt:
 
     st.markdown(render_user_message(prompt, messages[-1].get("timestamp", "")), unsafe_allow_html=True)
 
+    # Retrieve relevant information from the vector database
+    rag_context = get_relevant_context(prompt, k=3)
+
+    with st.expander("🔎 Retrieved Document Context"):
+        st.write(rag_context)
+
+    # Build the message sent to Groq
+    rag_prompt = f"""
+        Answer the user's question accurately.
+
+        There are two possible situations:
+
+        1. GENERAL QUESTION
+        If the question is general knowledge or unrelated to the user's documents,
+        answer using your normal knowledge.
+
+        2. DOCUMENT QUESTION
+        If the question asks about the user's documents, use ONLY the document
+        context provided below.
+
+        IMPORTANT:
+        - Do not invent facts from the documents.
+        - Do not assume that retrieved text is relevant just because it was retrieved.
+        - If the retrieved context does not actually answer the document-related
+        question, say that the documents do not contain enough information.
+        - Do not use general knowledge to fill missing information when the user
+        explicitly asks what the documents say.
+        - For general questions, completely ignore the document context if it is
+        irrelevant.
+
+        --- RETRIEVED DOCUMENT CONTEXT ---
+        {rag_context if rag_context else "NO RELEVANT DOCUMENT CONTEXT WAS FOUND."}
+        --- END DOCUMENT CONTEXT ---
+
+        USER QUESTION:
+        {prompt}
+        """
+
     api_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         *[
             {"role": message["role"], "content": message["content"]}
-            for message in messages
+            for message in messages[:-1]
         ],
+        {"role": "user", "content": rag_prompt},
     ]
 
     full_response = ""

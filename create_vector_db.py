@@ -10,7 +10,7 @@ from langchain_chroma import Chroma
 # SETTINGS
 # -----------------------------
 
-DATA_DIR = Path("documents")
+DATA_DIR = Path("data")
 CHROMA_DIR = "chroma_db"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
