@@ -40,6 +40,9 @@ streamlit run app.py
 ```
 .
 ├── app.py
+├── ui_fragments.py
+├── styles/
+│   └── app.css
 ├── requirements.txt
 ├── .env
 └── README.md

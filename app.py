@@ -1,7 +1,5 @@
-import html
 import json
 import os
-import re
 import tempfile
 import threading
 import asyncio
@@ -11,6 +9,15 @@ from pathlib import Path
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+from ui_fragments import (
+    close_assistant_row,
+    open_assistant_row,
+    render_hero,
+    render_message_actions,
+    render_missing_key_note,
+    render_user_message,
+    render_wordmark,
+)
 # TTS disabled for now — uncomment when re-enabling Edge TTS voice responses
 # import edge_tts
 
@@ -124,45 +131,6 @@ def clear_history():
 
 
 # ---------------------------------------------------------
-# Message rendering helpers (bubble layout)
-# ---------------------------------------------------------
-def render_user_message(content, timestamp=""):
-    """Full-width row, bubble pinned to the right, no avatar."""
-    safe_content = html.escape(content).replace("\n", "<br>")
-    time_html = f'<span class="msg-time">{html.escape(timestamp)}</span>' if timestamp else ""
-    st.markdown(
-        f'<div class="chat-row user-row">'
-        f'<div class="msg-bubble user-bubble">{safe_content}{time_html}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def open_assistant_row():
-    """Opens a full-width, left-aligned row for the assistant's plain-text reply."""
-    st.markdown('<div class="chat-row assistant-row"><div class="msg-plain">', unsafe_allow_html=True)
-
-
-def close_assistant_row():
-    st.markdown('</div></div>', unsafe_allow_html=True)
-
-
-def render_message_actions():
-    """Decorative action row under an assistant reply (visual only, not wired up)."""
-    st.markdown(
-        """
-        <div class="msg-actions">
-            <span title="Share">📤</span>
-            <span title="Regenerate">🔁</span>
-            <span title="Copy">📋</span>
-            <span title="More">⋯</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# ---------------------------------------------------------
 # TTS Functions (disabled for now — kept for future re-enabling)
 # ---------------------------------------------------------
 # def response_language(text):
@@ -226,403 +194,14 @@ def get_groq_client():
 
 
 # ---------------------------------------------------------
+def load_css() -> None:
+    css_path = Path(__file__).with_name("styles").joinpath("app.css")
+    st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+
+
 # Styling
 # ---------------------------------------------------------
-st.markdown(
-    """
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap');
-
-    :root {
-        --bg: #f5f5fb;
-        --surface: #ffffff;
-        --surface-alt: #f9f8fd;
-        --border: #e5e2f5;
-        --text: #1c1a2e;
-        --text-muted: #6b6885;
-        --text-faint: #a5a2c2;
-        --accent: #6d5bf6;
-        --accent-2: #9b6bf3;
-        --accent-soft: #f0edff;
-        --accent-gradient: linear-gradient(135deg, #6d5bf6 0%, #a855f7 100%);
-        --shadow-sm: 0 1px 2px rgba(28, 26, 46, 0.05);
-        --shadow-md: 0 10px 30px -14px rgba(85, 60, 200, 0.28);
-        --radius-lg: 20px;
-        --radius-md: 14px;
-    }
-
-    #MainMenu, footer, header {
-        visibility: hidden;
-    }
-
-    div[data-testid="stToolbar"],
-    div[data-testid="stDecoration"] {
-        display: none;
-    }
-
-    .stApp {
-        background:
-            radial-gradient(1200px 600px at 15% -10%, rgba(109, 91, 246, 0.08), transparent 60%),
-            radial-gradient(900px 500px at 100% 0%, rgba(168, 85, 247, 0.07), transparent 55%),
-            var(--bg);
-        font-family: 'Inter', sans-serif;
-        color: var(--text);
-    }
-
-    .block-container {
-        max-width: 720px;
-        padding-top: 1.5rem;
-        padding-bottom: 7.5rem;
-    }
-
-    /* ---------------- Top bar ---------------- */
-    .topbar {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 0.6rem 0.9rem;
-        background: rgba(246, 244, 240, 0.85);
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        border: 1px solid var(--border);
-        border-radius: 999px;
-        box-shadow: var(--shadow-sm);
-    }
-
-    .wordmark {
-        font-family: 'Space Grotesk', sans-serif;
-        font-weight: 700;
-        font-size: 1.05rem;
-        letter-spacing: -0.01em;
-        color: var(--text);
-        display: flex;
-        align-items: center;
-        gap: 0.35rem;
-    }
-
-    .wordmark .bolt {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 26px;
-        height: 26px;
-        border-radius: 8px;
-        background: var(--accent-gradient);
-        color: #fff;
-        font-size: 0.85rem;
-        box-shadow: 0 4px 12px -4px rgba(109, 91, 246, 0.5);
-    }
-
-    .wordmark span.accent {
-        color: var(--accent);
-    }
-
-    div[data-testid="stVerticalBlock"] > div:has(.wordmark) {
-        position: sticky;
-        top: 0;
-        z-index: 999;
-        background: transparent;
-        padding-top: 0.6rem;
-        padding-bottom: 0.6rem;
-    }
-
-    /* ---------------- Hero ---------------- */
-    .hero {
-        text-align: center;
-        padding: 4rem 0 2.25rem 0;
-    }
-
-    .hero .eyebrow {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.4rem;
-        font-size: 0.75rem;
-        font-weight: 600;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        color: var(--accent);
-        background: var(--accent-soft);
-        border: 1px solid rgba(109, 91, 246, 0.18);
-        padding: 0.3rem 0.75rem;
-        border-radius: 999px;
-        margin-bottom: 1.1rem;
-    }
-
-    .hero h1 {
-        font-family: 'Space Grotesk', sans-serif;
-        font-weight: 700;
-        font-size: 2.85rem;
-        letter-spacing: -0.02em;
-        line-height: 1.08;
-        margin-bottom: 0.85rem;
-        color: var(--text);
-    }
-
-    .hero h1 .accent {
-        background: var(--accent-gradient);
-        -webkit-background-clip: text;
-        background-clip: text;
-        color: transparent;
-    }
-
-    .hero p {
-        color: var(--text-muted);
-        font-size: 1.02rem;
-        margin: 0 auto;
-        max-width: 480px;
-    }
-
-    .hero .hint {
-        font-size: 0.85rem;
-        color: var(--text-faint);
-        margin-top: 0.9rem;
-    }
-
-    .no-key-note {
-        text-align: center;
-        color: var(--text-faint);
-        font-size: 0.85rem;
-        margin-top: 0.75rem;
-        background: var(--surface-alt);
-        border: 1px dashed var(--border);
-        border-radius: var(--radius-md);
-        padding: 0.6rem 1rem;
-        display: inline-block;
-    }
-
-    /* ---------------- Chat rows ---------------- */
-    .chat-row {
-        display: flex;
-        width: 100%;
-        margin: 0.35rem 0;
-        animation: bubble-in 0.25s ease-out;
-    }
-
-    @keyframes bubble-in {
-        from { opacity: 0; transform: translateY(4px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
-
-    /* ---- User row: bubble pinned to the right ---- */
-    .chat-row.user-row {
-        justify-content: flex-end;
-    }
-
-    .msg-bubble.user-bubble {
-        position: relative;
-        display: inline-block;
-        max-width: 82%;
-        background: var(--accent-soft);
-        border: 1px solid rgba(109, 91, 246, 0.14);
-        border-radius: var(--radius-md) var(--radius-md) 4px var(--radius-md);
-        padding: 0.8rem 1.05rem;
-        text-align: left;
-        line-height: 1.55;
-        box-shadow: var(--shadow-sm);
-    }
-
-    .msg-bubble.user-bubble .msg-time {
-        display: block;
-        margin-top: 0.3rem;
-        font-size: 0.72rem;
-        color: var(--text-faint);
-        text-align: right;
-    }
-
-    /* ---- Assistant row: plain text, flush left, no bubble ---- */
-    .chat-row.assistant-row {
-        justify-content: flex-start;
-    }
-
-    .msg-plain {
-        width: 100%;
-        line-height: 1.55;
-    }
-
-    .msg-actions {
-        display: flex;
-        align-items: center;
-        gap: 0.9rem;
-        margin-top: 0.6rem;
-        font-size: 0.95rem;
-        color: var(--text-faint);
-    }
-
-    .msg-actions span {
-        cursor: default;
-        opacity: 0.75;
-        transition: opacity 0.15s ease, transform 0.15s ease;
-    }
-
-    .msg-actions span:hover {
-        opacity: 1;
-        transform: translateY(-1px);
-        color: var(--accent);
-    }
-
-    /* ---------------- Buttons ---------------- */
-    .stButton > button {
-        background: var(--surface);
-        border: 1px solid var(--border);
-        color: var(--text-muted);
-        border-radius: 999px;
-        padding: 0.4rem 1.1rem;
-        font-size: 0.85rem;
-        font-weight: 500;
-        transition: all 0.15s ease;
-        box-shadow: var(--shadow-sm);
-    }
-
-    .stButton > button:hover:not(:disabled) {
-        border-color: var(--accent);
-        color: var(--accent);
-        background: var(--accent-soft);
-        transform: translateY(-1px);
-    }
-
-    .stButton > button:disabled {
-        opacity: 0.45;
-    }
-
-    /* ---------------- Chat input ---------------- */
-    div[data-testid="stChatInput"] {
-        background: var(--surface);
-        border: 1px solid var(--border);
-        border-radius: 32px;
-        box-shadow: var(--shadow-md);
-        padding: 0.25rem 0.35rem;
-        transition: border-color 0.15s ease, box-shadow 0.15s ease;
-    }
-
-    div[data-testid="stChatInput"]:focus-within {
-        border-color: var(--accent);
-        box-shadow: 0 14px 34px -14px rgba(109, 91, 246, 0.35);
-    }
-
-    /* Strip Streamlit's own inner border/focus-ring so only our pill border shows */
-    div[data-testid="stChatInput"] *:focus,
-    div[data-testid="stChatInput"] *:focus-within,
-    div[data-testid="stChatInput"] *:focus-visible {
-        outline: none !important;
-        box-shadow: none !important;
-    }
-
-    div[data-testid="stChatInput"] > div,
-    div[data-testid="stChatInput"] [data-baseweb="textarea"],
-    div[data-testid="stChatInput"] [data-baseweb="base-input"],
-    div[data-testid="stChatInput"] [data-testid="stChatInputContainer"] {
-        border: none !important;
-        box-shadow: none !important;
-        background: transparent !important;
-    }
-
-    div[data-testid="stChatInput"] textarea {
-        background: transparent !important;
-        color: var(--text) !important;
-        padding-left: 0.5rem !important;
-    }
-
-    div[data-testid="stChatInput"] textarea::placeholder {
-        color: var(--text-faint) !important;
-    }
-
-    /* Circular buttons inside the pill (mic + send) */
-    div[data-testid="stChatInput"] button {
-        border-radius: 50% !important;
-        transition: transform 0.15s ease, background 0.15s ease;
-        border: none !important;
-    }
-
-    div[data-testid="stChatInput"] button:hover {
-        transform: scale(1.06);
-    }
-
-    /* Send button — solid dark/purple circle with white arrow, like the reference */
-    div[data-testid="stChatInput"] button[data-testid="stChatInputSubmitButton"],
-    div[data-testid="stChatInput"] button[kind="chatInputSubmitButton"] {
-        background: var(--accent-gradient) !important;
-        box-shadow: 0 6px 16px -6px rgba(109, 91, 246, 0.55);
-    }
-
-    div[data-testid="stChatInput"] button[data-testid="stChatInputSubmitButton"] svg,
-    div[data-testid="stChatInput"] button[kind="chatInputSubmitButton"] svg {
-        fill: #ffffff !important;
-        color: #ffffff !important;
-    }
-
-    /* Mic / other buttons — soft lavender circle */
-    div[data-testid="stChatInput"] button:not([data-testid="stChatInputSubmitButton"]):not([kind="chatInputSubmitButton"]) {
-        background: var(--accent-soft) !important;
-    }
-
-    div[data-testid="stChatInput"] button:not([data-testid="stChatInputSubmitButton"]):not([kind="chatInputSubmitButton"]) svg {
-        fill: var(--accent) !important;
-        color: var(--accent) !important;
-    }
-
-    div[data-testid="stBottom"],
-    div[data-testid="stBottom"] > div,
-    div[data-testid="stBottomBlockContainer"],
-    section[data-testid="stBottom"],
-    .stChatFloatingInputContainer {
-        background: transparent !important;
-        box-shadow: none !important;
-        border: none !important;
-    }
-
-    /* ---------------- Audio + captions ---------------- */
-    div[data-testid="stAudio"] {
-        margin-top: 0.6rem;
-        border-radius: 999px;
-        overflow: hidden;
-    }
-
-    div[data-testid="stCaptionContainer"] {
-        color: var(--text-faint) !important;
-        font-size: 0.8rem !important;
-    }
-
-    /* ---------------- Expander (debug info) ---------------- */
-    div[data-testid="stExpander"] {
-        border: 1px solid var(--border);
-        border-radius: var(--radius-md);
-        background: var(--surface-alt);
-        box-shadow: var(--shadow-sm);
-    }
-
-    /* ---------------- Scrollbar ---------------- */
-    ::-webkit-scrollbar {
-        width: 8px;
-        height: 8px;
-    }
-
-    ::-webkit-scrollbar-thumb {
-        background: var(--border);
-        border-radius: 999px;
-    }
-
-    ::-webkit-scrollbar-thumb:hover {
-        background: var(--text-faint);
-    }
-
-    @media (max-width: 640px) {
-        .block-container {
-            padding-left: 1rem;
-            padding-right: 1rem;
-        }
-
-        .hero {
-            padding-top: 2.5rem;
-        }
-
-        .hero h1 {
-            font-size: 2.1rem;
-        }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+load_css()
 
 
 # ---------------------------------------------------------
@@ -635,10 +214,7 @@ with top_bar:
     left, spacer, right = st.columns([5, 1, 1.2])
 
     with left:
-        st.markdown(
-            '<div class="wordmark"><span class="bolt">✨</span>AI <span class="accent">Chatbot</span></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(render_wordmark(), unsafe_allow_html=True)
 
     with right:
         messages_for_button = load_history()
@@ -662,23 +238,10 @@ messages = load_history()
 # Hero
 # ---------------------------------------------------------
 if not messages:
-    st.markdown(
-        """
-        <div class="hero">
-            <div class="eyebrow">✨ AI Chatbot · Powered by Groq</div>
-            <h1>Ask at the <span class="accent">speed</span><br>of thought</h1>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.markdown(render_hero(), unsafe_allow_html=True)
 
     if not GROQ_API_KEY:
-        st.markdown(
-            '<div style="text-align:center;">'
-            '<p class="no-key-note">⚠️ Missing GROQ_API_KEY in .env file</p>'
-            '</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown(render_missing_key_note(), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------
@@ -686,12 +249,12 @@ if not messages:
 # ---------------------------------------------------------
 for message in messages:
     if message["role"] == "user":
-        render_user_message(message["content"], message.get("timestamp", ""))
+        st.markdown(render_user_message(message["content"], message.get("timestamp", "")), unsafe_allow_html=True)
     else:
-        open_assistant_row()
+        st.markdown(open_assistant_row(), unsafe_allow_html=True)
         st.markdown(message["content"])
-        render_message_actions()
-        close_assistant_row()
+        st.markdown(render_message_actions(), unsafe_allow_html=True)
+        st.markdown(close_assistant_row(), unsafe_allow_html=True)
 
 # ---------------------------------------------------------
 # Web Speech API STT (disabled for now — kept for future re-enabling)
@@ -819,7 +382,7 @@ if prompt:
     # Save the user message
     messages = append_message("user", prompt)
 
-    render_user_message(prompt, messages[-1].get("timestamp", ""))
+    st.markdown(render_user_message(prompt, messages[-1].get("timestamp", "")), unsafe_allow_html=True)
 
     api_messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -833,7 +396,7 @@ if prompt:
     response_succeeded = False
     error_message = None
 
-    open_assistant_row()
+    st.markdown(open_assistant_row(), unsafe_allow_html=True)
     placeholder = st.empty()
 
     try:
@@ -860,7 +423,7 @@ if prompt:
             raise RuntimeError("The model returned an empty response.")
 
         placeholder.markdown(full_response)
-        render_message_actions()
+        st.markdown(render_message_actions(), unsafe_allow_html=True)
         response_succeeded = True
 
     except Exception as error:
@@ -869,7 +432,7 @@ if prompt:
         print(f"Groq chat error: {type(error).__name__}: {error}")
 
     finally:
-        close_assistant_row()
+        st.markdown(close_assistant_row(), unsafe_allow_html=True)
 
     if error_message:
         st.error(f"AI Response failed: {error_message}")
