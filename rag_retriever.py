@@ -89,3 +89,6 @@ def get_relevant_context(query, k=5):
         return ""
 
     return "\n\n".join(context_parts)
+
+    st.write("### 🔎 Retrieved Document Context")
+    st.code(rag_context if rag_context else "NO CONTEXT RETRIEVED")
