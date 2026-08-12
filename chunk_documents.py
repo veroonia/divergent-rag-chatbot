@@ -1,80 +1,237 @@
 from pathlib import Path
+import re
+import uuid
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-# ---------------------------------------------------------
-# Paths
-# ---------------------------------------------------------
+DATA_DIR = Path(__file__).resolve().parent / "data"
+PDF_PATH = DATA_DIR / "Divergent.pdf"
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+# Approximate token targets
+PARENT_CHUNK_SIZE = 1500
+PARENT_CHUNK_OVERLAP = 150
 
-
-# ---------------------------------------------------------
-# Find all PDFs
-# ---------------------------------------------------------
-
-pdf_files = sorted(DATA_DIR.glob("*.pdf"))
-
-print(f"Found {len(pdf_files)} PDF files.")
-
-if not pdf_files:
-    print("ERROR: No PDF files found in the data folder.")
-    raise SystemExit(1)
+CHILD_CHUNK_SIZE = 350
+CHILD_CHUNK_OVERLAP = 50
 
 
-# ---------------------------------------------------------
-# Load documents
-# ---------------------------------------------------------
+def load_book():
+    print(f"Loading: {PDF_PATH}")
 
-documents = []
+    loader = PyMuPDF4LLMLoader(
+        str(PDF_PATH),
+        mode="page"
+    )
 
-for pdf_path in pdf_files:
-    print(f"\nLoading: {pdf_path.name}")
+    documents = loader.load()
 
-    try:
-        loader = PyPDFLoader(str(pdf_path))
-        pages = loader.load()
+    print(f"Pages loaded: {len(documents)}")
 
-        print(f"→ {len(pages)} pages loaded")
-
-        # Store the source filename in metadata
-        for page in pages:
-            page.metadata["source_file"] = pdf_path.name
-
-        documents.extend(pages)
-
-    except Exception as error:
-        print(f"ERROR loading {pdf_path.name}: {error}")
+    return documents
 
 
-print(f"\nTotal documents/pages: {len(documents)}")
+def clean_text(text):
+    text = text.replace("\r\n", "\n")
+    text = text.replace("\r", "\n")
+
+    # Remove excessive whitespace
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
 
 
-# ---------------------------------------------------------
-# Split documents into chunks
-# ---------------------------------------------------------
+def detect_chapter(text):
+    match = re.search(
+        r"(?i)\bChapter\s+([A-Za-z]+(?:[-\s][A-Za-z]+)*)\b",
+        text
+    )
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,
-    chunk_overlap=200,
-)
+    if match:
+        return f"Chapter {match.group(1)}"
 
-chunks = text_splitter.split_documents(documents)
-
-print(f"Total chunks created: {len(chunks)}")
+    return None
 
 
-# ---------------------------------------------------------
-# Show sample chunks
-# ---------------------------------------------------------
+def is_front_matter(text):
+    """
+    Remove pages before the actual novel begins.
+    """
 
-print("\n--- SAMPLE CHUNKS ---\n")
+    lower = text.lower()
 
-for i, chunk in enumerate(chunks[:5], start=1):
-    print(f"--- Chunk {i} ---")
-    print(f"Source: {chunk.metadata.get('source_file')}")
-    print(chunk.page_content[:1000])
-    print()
+    front_matter_terms = [
+        "# divergent",
+        "# veronica roth",
+        "dedication",
+        "contents",
+        "table of contents"
+    ]
+
+    return any(term in lower for term in front_matter_terms)
+
+
+def create_page_documents(documents):
+    """
+    Clean pages, remove front matter and track the current chapter.
+    """
+
+    processed_pages = []
+
+    current_chapter = None
+
+    for document in documents:
+
+        text = clean_text(document.page_content)
+
+        if not text:
+            continue
+
+        # Skip title / contents / dedication pages
+        if is_front_matter(text):
+            continue
+
+        detected = detect_chapter(text)
+
+        if detected:
+            current_chapter = detected
+
+        page_number = document.metadata.get("page")
+
+        processed_pages.append({
+            "text": text,
+            "page": page_number,
+            "chapter": current_chapter
+        })
+
+    return processed_pages
+
+
+def create_parent_chunks(pages):
+
+    # RecursiveCharacterTextSplitter uses characters.
+    # 1500 tokens is roughly 6000 characters for English.
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=6000,
+        chunk_overlap=600,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            "? ",
+            "! ",
+            " ",
+            ""
+        ]
+    )
+
+    parents = []
+
+    for page in pages:
+
+        chunks = parent_splitter.split_text(page["text"])
+
+        for chunk in chunks:
+
+            parent_id = str(uuid.uuid4())
+
+            parents.append({
+                "id": parent_id,
+                "text": chunk,
+                "metadata": {
+                    "source": str(PDF_PATH),
+                    "page": page["page"],
+                    "chapter": page["chapter"],
+                    "type": "parent"
+                }
+            })
+
+    return parents
+
+
+def create_child_chunks(parents):
+
+    # ~350 tokens ≈ 1400 characters
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1400,
+        chunk_overlap=200,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            "? ",
+            "! ",
+            " ",
+            ""
+        ]
+    )
+
+    children = []
+
+    for parent in parents:
+
+        child_chunks = child_splitter.split_text(
+            parent["text"]
+        )
+
+        for child_number, child_text in enumerate(child_chunks):
+
+            child_id = str(uuid.uuid4())
+
+            children.append({
+                "id": child_id,
+                "text": child_text,
+                "metadata": {
+                    "source": parent["metadata"]["source"],
+                    "page": parent["metadata"]["page"],
+                    "chapter": parent["metadata"]["chapter"],
+                    "type": "child",
+                    "parent_id": parent["id"],
+                    "child_number": child_number
+                }
+            })
+
+    return children
+
+
+if __name__ == "__main__":
+
+    documents = load_book()
+
+    print("\nCleaning pages and detecting chapters...")
+
+    pages = create_page_documents(documents)
+
+    print(f"Usable pages: {len(pages)}")
+
+    print("\nCreating parent chunks...")
+
+    parents = create_parent_chunks(pages)
+
+    print(f"Parents created: {len(parents)}")
+
+    print("\nCreating child chunks...")
+
+    children = create_child_chunks(parents)
+
+    print(f"Children created: {len(children)}")
+
+    print("\n" + "=" * 60)
+    print("EXAMPLE PARENT")
+    print("=" * 60)
+
+    print(parents[0]["text"])
+
+    print("\nMetadata:")
+    print(parents[0]["metadata"])
+
+    print("\n" + "=" * 60)
+    print("EXAMPLE CHILD")
+    print("=" * 60)
+
+    print(children[0]["text"])
+
+    print("\nMetadata:")
+    print(children[0]["metadata"])

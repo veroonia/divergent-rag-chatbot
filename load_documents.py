@@ -1,5 +1,6 @@
 from pathlib import Path
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_pymupdf4llm import PyMuPDF4LLMLoader
+
 
 # Folder containing your PDFs
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -19,11 +20,16 @@ all_documents = []
 for pdf_file in pdf_files:
     print(f"Loading: {pdf_file.name}")
 
-    loader = PyPDFLoader(str(pdf_file))
+    loader = PyMuPDF4LLMLoader(
+        str(pdf_file),
+        mode="page"
+    )
+
     documents = loader.load()
 
     print(f"  Pages loaded: {len(documents)}")
 
     all_documents.extend(documents)
+
 
 print(f"\nTotal pages loaded: {len(all_documents)}")
