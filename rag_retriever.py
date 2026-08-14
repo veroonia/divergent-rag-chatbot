@@ -1,21 +1,30 @@
 from pathlib import Path
 
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+from langchain_qdrant import QdrantVectorStore
 
 
-# ---------------------------------------------------------
+# ============================================================
 # SETTINGS
-# ---------------------------------------------------------
+# ============================================================
 
-CHROMA_DIR = str(Path(__file__).resolve().parent / "chroma_db")
+QDRANT_URL = "http://localhost:6333"
+
+COLLECTION_NAME = "divergent_children"
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Chroma/Qdrant distance:
+# Lower distance = more similar.
+#
+# This is only used AFTER we already know the question
+# is a document-related question.
+SIMILARITY_THRESHOLD = 0.65
 
-# ---------------------------------------------------------
+
+# ============================================================
 # LOAD EMBEDDING MODEL
-# ---------------------------------------------------------
+# ============================================================
 
 print("Loading embedding model...")
 
@@ -23,72 +32,115 @@ embeddings = HuggingFaceEmbeddings(
     model_name=EMBEDDING_MODEL
 )
 
+print("Embedding model loaded.")
 
-# ---------------------------------------------------------
-# LOAD CHROMA DATABASE
-# ---------------------------------------------------------
 
-print("Loading Chroma database...")
+# ============================================================
+# LOAD QDRANT DATABASE
+# ============================================================
 
-vector_db = Chroma(
-    persist_directory=CHROMA_DIR,
-    embedding_function=embeddings
+print("Connecting to Qdrant...")
+
+print(f"Qdrant: {QDRANT_URL}")
+print(f"Collection: {COLLECTION_NAME}")
+
+vector_db = QdrantVectorStore.from_existing_collection(
+    embedding=embeddings,
+    collection_name=COLLECTION_NAME,
+    url=QDRANT_URL,
 )
 
+print("Qdrant vector database loaded.")
 
-# ---------------------------------------------------------
+
+# ============================================================
 # RETRIEVE DOCUMENTS
-# ---------------------------------------------------------
+# ============================================================
 
 def retrieve_documents(query, k=5):
     """
-    Retrieve the most relevant document chunks.
+    Retrieve the most relevant document chunks from Qdrant.
+
+    This function does NOT decide whether the question is
+    about the book.
+
+    That decision is handled by the document/general router
+    in app.py.
     """
 
     results = vector_db.similarity_search_with_score(
         query,
-        k=k
+        k=k,
     )
 
     return results
 
 
-# ---------------------------------------------------------
+# ============================================================
 # GET RELEVANT CONTEXT
-# ---------------------------------------------------------
+# ============================================================
 
 def get_relevant_context(query, k=5):
     """
-    Retrieve document chunks only when they are
-    sufficiently relevant to the user's question.
+    Retrieve relevant document chunks.
+
+    Lower Qdrant distance means a better semantic match.
+
+    Weak matches are ignored using SIMILARITY_THRESHOLD.
     """
 
-    results = retrieve_documents(query, k=k)
+    results = retrieve_documents(
+        query,
+        k=k,
+    )
 
     if not results:
         return ""
 
     context_parts = []
 
-    # Chroma returns:
-    # (Document, distance)
-    #
-    # Lower distance = more similar.
-    
     for i, (doc, distance) in enumerate(results, 1):
 
-        # Ignore weak matches
-        if distance > 1.0:
+        # ----------------------------------------------------
+        # Ignore weak semantic matches
+        # ----------------------------------------------------
+
+        if distance > SIMILARITY_THRESHOLD:
             continue
 
+        # ----------------------------------------------------
+        # Extract metadata
+        # ----------------------------------------------------
+
+        book = doc.metadata.get(
+            "book",
+            "Unknown",
+        )
+
+        chapter = doc.metadata.get(
+            "chapter",
+            "Unknown",
+        )
+
+        source = doc.metadata.get(
+            "source",
+            "Unknown",
+        )
+
+        # ----------------------------------------------------
+        # Build context
+        # ----------------------------------------------------
+
         context_parts.append(
-            f"[Source {i}]\n{doc.page_content}"
+            f"[Source {i}]\n"
+            f"Book: {book}\n"
+            f"Chapter: {chapter}\n"
+            f"Source file: {source}\n"
+            f"Relevance score: {distance:.4f}\n\n"
+            f"{doc.page_content}"
         )
 
     if not context_parts:
         return ""
 
     return "\n\n".join(context_parts)
-
-    st.write("### 🔎 Retrieved Document Context")
-    st.code(rag_context if rag_context else "NO CONTEXT RETRIEVED")

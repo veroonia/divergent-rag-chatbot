@@ -2,229 +2,465 @@ import json
 import os
 import tempfile
 import threading
-import asyncio
 from datetime import datetime
 from pathlib import Path
-
-from rag_retriever import get_relevant_context
 
 import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
+
+from rag_retriever import get_relevant_context
+
 from html_utils import (
     close_assistant_row,
     open_assistant_row,
     render_message_actions,
     render_user_message,
 )
-# TTS disabled for now — uncomment when re-enabling Edge TTS voice responses
-# import edge_tts
 
-# ---------------------------------------------------------
-# Page config
-# ---------------------------------------------------------
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
 st.set_page_config(
     page_title="AI Chatbot",
     page_icon="✨",
     layout="centered",
 )
 
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
 load_dotenv()
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get(
+    "GROQ_API_KEY",
+    "",
+).strip()
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 HISTORY_FILE = "chat_history.json"
+
 HISTORY_LOCK = threading.RLock()
 
-# ---------------------------------------------------------
-# Models / voice configuration
-# ---------------------------------------------------------
 CHAT_MODEL = "openai/gpt-oss-20b"
+
 TEMPERATURE = 0.7
+
+
+# ============================================================
+# SYSTEM PROMPT
+# ============================================================
+
 SYSTEM_PROMPT = """
 You are a helpful, accurate, and concise AI assistant.
 
-You can answer two types of questions:
+You can answer two types of questions.
 
-1. General questions:
-Answer using your general knowledge.
+1. GENERAL QUESTIONS
 
-2. Questions about the user's documents:
-Use the provided document context as the primary source.
+If the user asks a general knowledge question that is
+unrelated to the document, answer normally using your
+general knowledge.
 
-Rules:
+2. DOCUMENT QUESTIONS
 
-- If the question is general knowledge and unrelated to the documents,
-  answer normally.
-- If the question asks about the documents, rely only on the retrieved
+If the user asks about the document, use ONLY the
+retrieved document context provided in the current request.
+
+IMPORTANT RULES FOR DOCUMENT QUESTIONS:
+
+- Do not use general knowledge to fill missing information.
+- Do not invent facts from the document.
+- Do not assume that a retrieved passage answers the question.
+- Only state information that is supported by the retrieved
   document context.
-- Never invent or hallucinate information from the documents.
-- Never claim something is in the documents unless the provided context
-  supports it.
-- If the retrieved context does not contain enough information to answer
-  a document-specific question, explicitly say so.
-- Do not force document context into unrelated questions.
-- Be clear, concise, and accurate.
+- If the retrieved context does not contain enough information
+  to answer the question, explicitly say that the available
+  document context does not contain enough information.
+- Never claim that something appears in the document unless
+  the retrieved context supports it.
+- Be concise and directly answer the user's question.
+
+For general questions, completely ignore the document context.
 """
 
-# Edge TTS voice configuration (disabled for now)
-# EDGE_TTS_EN_VOICE = "en-US-JennyNeural"
-# EDGE_TTS_AR_VOICE = "ar-EG-SalmaNeural"
-# MAX_TTS_CHARS = 3000
 
-# ---------------------------------------------------------
-# Shared chat history
-# ---------------------------------------------------------
+# ============================================================
+# DOCUMENT ROUTING PROMPT
+# ============================================================
+
+ROUTER_PROMPT = """
+You are a question router for a chatbot that has access to
+the novel "Divergent".
+
+Your job is to classify the user's question into exactly
+ONE of these two categories:
+
+DOCUMENT
+GENERAL
+
+Return ONLY the word:
+
+DOCUMENT
+
+or:
+
+GENERAL
+
+
+Choose DOCUMENT when the user is asking about:
+
+- Divergent
+- Tris
+- Beatrice Prior
+- Four
+- Tobias
+- Christina
+- Caleb
+- Peter
+- Dauntless
+- Abnegation
+- Erudite
+- Amity
+- Candor
+- factions
+- initiation
+- the characters
+- events in the novel
+- chapters
+- scenes
+- relationships between characters
+- anything that clearly refers to the contents of the book
+
+
+Choose GENERAL when the question is unrelated to the novel.
+
+Examples:
+
+"What is the capital of France?"
+GENERAL
+
+"Give me five places to visit in Cairo."
+GENERAL
+
+"How does photosynthesis work?"
+GENERAL
+
+"What faction was Tris born into?"
+DOCUMENT
+
+"Why does Tris choose Dauntless?"
+DOCUMENT
+
+"Who is Four?"
+DOCUMENT
+
+"What happens during Tris's initiation?"
+DOCUMENT
+
+"Who is Tris's mother?"
+DOCUMENT
+
+
+Important:
+
+If the question clearly refers to a character, event,
+location, faction, chapter, or other element of Divergent,
+classify it as DOCUMENT.
+
+Return ONLY DOCUMENT or GENERAL.
+"""
+
+
+# ============================================================
+# HISTORY FUNCTIONS
+# ============================================================
+
 def _is_valid_history(data):
+    """
+    Validate the structure of saved chat history.
+    """
+
     if not isinstance(data, list):
         return False
 
     for item in data:
+
         if not isinstance(item, dict):
             return False
-        if item.get("role") not in {"user", "assistant"}:
+
+        if item.get("role") not in {
+            "user",
+            "assistant",
+        }:
             return False
-        if not isinstance(item.get("content"), str):
+
+        if not isinstance(
+            item.get("content"),
+            str,
+        ):
             return False
 
     return True
 
 
 def load_history():
+    """
+    Load chat history from JSON.
+    """
+
     with HISTORY_LOCK:
+
         if not os.path.exists(HISTORY_FILE):
             return []
 
         try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as file:
+
+            with open(
+                HISTORY_FILE,
+                "r",
+                encoding="utf-8",
+            ) as file:
+
                 data = json.load(file)
 
-            return data if _is_valid_history(data) else []
-        except (json.JSONDecodeError, OSError):
+            if _is_valid_history(data):
+                return data
+
+            return []
+
+        except (
+            json.JSONDecodeError,
+            OSError,
+        ):
+
             return []
 
 
 def save_history(messages):
+    """
+    Save chat history safely using a temporary file.
+    """
+
     with HISTORY_LOCK:
-        directory = os.path.dirname(os.path.abspath(HISTORY_FILE)) or "."
+
+        directory = (
+            os.path.dirname(
+                os.path.abspath(
+                    HISTORY_FILE
+                )
+            )
+            or "."
+        )
+
         temp_path = None
 
         try:
+
             fd, temp_path = tempfile.mkstemp(
                 prefix="chat_history_",
                 suffix=".tmp",
                 dir=directory,
             )
 
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(messages, file, ensure_ascii=False, indent=2)
+            with os.fdopen(
+                fd,
+                "w",
+                encoding="utf-8",
+            ) as file:
 
-            os.replace(temp_path, HISTORY_FILE)
+                json.dump(
+                    messages,
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            os.replace(
+                temp_path,
+                HISTORY_FILE,
+            )
 
         except OSError as error:
-            print(f"History save error: {error}")
-            if temp_path and os.path.exists(temp_path):
+
+            print(
+                f"History save error: {error}"
+            )
+
+            if (
+                temp_path
+                and os.path.exists(temp_path)
+            ):
+
                 try:
                     os.remove(temp_path)
+
                 except OSError:
                     pass
 
 
-def append_message(role, content):
+def append_message(
+    role,
+    content,
+):
+
     with HISTORY_LOCK:
+
         messages = load_history()
+
         messages.append(
             {
                 "role": role,
                 "content": content,
-                "timestamp": datetime.now().strftime("%H:%M"),
+                "timestamp": datetime.now().strftime(
+                    "%H:%M"
+                ),
             }
         )
+
         save_history(messages)
+
         return messages
 
 
 def clear_history():
+
     with HISTORY_LOCK:
+
         try:
-            if os.path.exists(HISTORY_FILE):
-                os.remove(HISTORY_FILE)
+
+            if os.path.exists(
+                HISTORY_FILE
+            ):
+
+                os.remove(
+                    HISTORY_FILE
+                )
+
         except OSError as error:
-            st.error(f"Could not clear the chat: {error}")
+
+            st.error(
+                f"Could not clear the chat: {error}"
+            )
 
 
-# ---------------------------------------------------------
-# TTS Functions (disabled for now — kept for future re-enabling)
-# ---------------------------------------------------------
-# def response_language(text):
-#     arabic = len(re.findall(r"[\u0600-\u06FF]", text))
-#     latin = len(re.findall(r"[A-Za-z]", text))
-#     return "ar" if arabic > latin else "en"
-#
-#
-# def generate_edge_tts_audio(text):
-#     if not text:
-#         return []
-#
-#     text = re.sub(r"```.*?```", "code omitted", text, flags=re.DOTALL)
-#     text = re.sub(r"\s+", " ", text).strip()
-#
-#     if len(text) > MAX_TTS_CHARS:
-#         text = text[:MAX_TTS_CHARS] + "..."
-#
-#     if not text:
-#         return []
-#
-#     lang = response_language(text)
-#     voice = EDGE_TTS_AR_VOICE if lang == "ar" else EDGE_TTS_EN_VOICE
-#
-#     output_file = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-#     output_path = output_file.name
-#     output_file.close()
-#
-#     try:
-#         async def generate_tts():
-#             communicate = edge_tts.Communicate(text, voice)
-#             await communicate.save(output_path)
-#
-#         asyncio.run(generate_tts())
-#
-#         with open(output_path, "rb") as f:
-#             audio_bytes = f.read()
-#
-#         if not audio_bytes:
-#             raise RuntimeError("Edge TTS returned empty audio.")
-#
-#         return [audio_bytes]
-#
-#     except Exception as e:
-#         print(f"Edge TTS error: {type(e).__name__}: {e}")
-#         raise RuntimeError(f"TTS generation failed: {str(e)}")
-#     finally:
-#         try:
-#             os.unlink(output_path)
-#         except OSError:
-#             pass
+# ============================================================
+# GROQ CLIENT
+# ============================================================
 
-
-# ---------------------------------------------------------
-# Get Groq client
-# ---------------------------------------------------------
 def get_groq_client():
+
     if not GROQ_API_KEY:
-        raise RuntimeError("GROQ_API_KEY is not configured.")
-    return Groq(api_key=GROQ_API_KEY)
+
+        raise RuntimeError(
+            "GROQ_API_KEY is not configured."
+        )
+
+    return Groq(
+        api_key=GROQ_API_KEY
+    )
 
 
-# ---------------------------------------------------------
-def load_css() -> None:
-    css_path = Path(__file__).with_name("styles").joinpath("app.css")
-    st.markdown(f"<style>{css_path.read_text(encoding='utf-8')}</style>", unsafe_allow_html=True)
+# ============================================================
+# QUESTION ROUTER
+# ============================================================
 
-# ---------------------------------------------------------
-# Hero / UI components
-# ---------------------------------------------------------
+def classify_question(prompt):
+    """
+    Decide whether the question is about Divergent
+    or is a general question.
+
+    Returns:
+
+        "DOCUMENT"
+
+    or:
+
+        "GENERAL"
+    """
+
+    client = get_groq_client()
+
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": ROUTER_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        temperature=0,
+        max_tokens=10,
+    )
+
+    result = (
+        response.choices[0]
+        .message
+        .content
+        .strip()
+        .upper()
+    )
+
+    # --------------------------------------------------------
+    # Keep only the expected classifications
+    # --------------------------------------------------------
+
+    if "DOCUMENT" in result:
+        return "DOCUMENT"
+
+    if "GENERAL" in result:
+        return "GENERAL"
+
+    # --------------------------------------------------------
+    # Safe fallback
+    # --------------------------------------------------------
+
+    print(
+        f"Unexpected router result: {result}"
+    )
+
+    return "GENERAL"
+
+
+# ============================================================
+# CSS
+# ============================================================
+
+def load_css():
+
+    css_path = (
+        Path(__file__)
+        .with_name("styles")
+        .joinpath("app.css")
+    )
+
+    st.markdown(
+        f"<style>{css_path.read_text(encoding='utf-8')}</style>",
+        unsafe_allow_html=True,
+    )
+
+
+load_css()
+
+
+# ============================================================
+# HERO
+# ============================================================
+
 def render_hero():
+
     return """
     <div class="hero">
         <h1>How can I help you?</h1>
@@ -234,6 +470,7 @@ def render_hero():
 
 
 def render_missing_key_note():
+
     return """
     <div class="missing-key-note">
         <strong>Groq API key not configured.</strong>
@@ -241,251 +478,409 @@ def render_missing_key_note():
     </div>
     """
 
-# Styling
-# ---------------------------------------------------------
-load_css()
 
+# ============================================================
+# TOP BAR
+# ============================================================
 
-# ---------------------------------------------------------
-# Top bar
-# ---------------------------------------------------------
 top_bar = st.container()
 
 with top_bar:
-    st.markdown('<div class="topbar-wrap">', unsafe_allow_html=True)
-    left, spacer, right = st.columns([5, 1, 1.2])
+
+    st.markdown(
+        '<div class="topbar-wrap">',
+        unsafe_allow_html=True,
+    )
+
+    left, spacer, right = st.columns(
+        [5, 1, 1.2]
+    )
 
     with left:
-                st.markdown("""
-        <div class="wordmark">
-            Your Chatbot
-        </div>
-        """, unsafe_allow_html=True)
+
+        st.markdown(
+            """
+            <div class="wordmark">
+                Your Chatbot
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     with right:
-        messages_for_button = load_history()
+
+        messages_for_button = (
+            load_history()
+        )
+
         if st.button(
             "Clear",
             use_container_width=True,
             disabled=not messages_for_button,
         ):
+
             clear_history()
+
             st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
 
-# ---------------------------------------------------------
-# History
-# ---------------------------------------------------------
+# ============================================================
+# LOAD HISTORY
+# ============================================================
+
 messages = load_history()
 
 
-# ---------------------------------------------------------
-# Hero
-# ---------------------------------------------------------
+# ============================================================
+# HERO
+# ============================================================
+
 if not messages:
-    st.markdown(render_hero(), unsafe_allow_html=True)
+
+    st.markdown(
+        render_hero(),
+        unsafe_allow_html=True,
+    )
 
     if not GROQ_API_KEY:
-        st.markdown(render_missing_key_note(), unsafe_allow_html=True)
+
+        st.markdown(
+            render_missing_key_note(),
+            unsafe_allow_html=True,
+        )
 
 
-# ---------------------------------------------------------
-# Render history
-# ---------------------------------------------------------
+# ============================================================
+# RENDER CHAT HISTORY
+# ============================================================
+
 for message in messages:
+
     if message["role"] == "user":
-        st.markdown(render_user_message(message["content"], message.get("timestamp", "")), unsafe_allow_html=True)
+
+        st.markdown(
+            render_user_message(
+                message["content"],
+                message.get(
+                    "timestamp",
+                    "",
+                ),
+            ),
+            unsafe_allow_html=True,
+        )
+
     else:
-        st.markdown(open_assistant_row(), unsafe_allow_html=True)
-        st.markdown(message["content"])
-        st.markdown(render_message_actions(), unsafe_allow_html=True)
-        st.markdown(close_assistant_row(), unsafe_allow_html=True)
 
-# ---------------------------------------------------------
-# Web Speech API STT (disabled for now — kept for future re-enabling)
-# ---------------------------------------------------------
-# st.iframe("""
-# <!doctype html>
-# <html><body><script>
-# (() => {
-#   const parentDocument = window.parent.document;
-#   const Recognition = window.parent.SpeechRecognition || window.parent.webkitSpeechRecognition;
-#   if (!Recognition) return;
-#
-#   let recognition;
-#   let listening = false;
-#   let transcript = '';
-#
-#   const getChatInput = () => parentDocument.querySelector(
-#     '[data-testid="stChatInput"] textarea, [data-testid="stChatInput"] input'
-#   );
-#
-#   function setInputValue(input, value) {
-#     const prototype = Object.getPrototypeOf(input);
-#     const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-#     setter.call(input, value);
-#     input.dispatchEvent(new Event('input', { bubbles: true }));
-#     input.dispatchEvent(new Event('change', { bubbles: true }));
-#   }
-#
-#   function submitTranscript() {
-#     const input = getChatInput();
-#     if (!input || !transcript.trim()) return;
-#     setInputValue(input, transcript.trim());
-#     setTimeout(() => {
-#       const form = input.closest('form');
-#       const submitButton = form?.querySelector('button[type="submit"]');
-#       if (submitButton && !submitButton.disabled) submitButton.click();
-#     }, 100);
-#   }
-#
-#   function stopListening() {
-#     listening = false;
-#     if (recognition) {
-#       try { recognition.stop(); } catch (_) {}
-#     }
-#   }
-#
-#   function startListening() {
-#     transcript = '';
-#     recognition = new Recognition();
-#     recognition.lang = navigator.language || 'en-US';
-#     recognition.continuous = false;
-#     recognition.interimResults = false;
-#     recognition.onstart = () => { listening = true; };
-#     recognition.onresult = event => {
-#       for (let i = event.resultIndex; i < event.results.length; i += 1) {
-#         if (event.results[i].isFinal) transcript += event.results[i][0].transcript;
-#       }
-#     };
-#     recognition.onerror = () => { listening = false; };
-#     recognition.onend = () => {
-#       const hadTranscript = transcript.trim();
-#       listening = false;
-#       if (hadTranscript) submitTranscript();
-#     };
-#     try { recognition.start(); } catch (_) {}
-#   }
-#
-#   function hookMicrophone() {
-#     const chatInput = parentDocument.querySelector('[data-testid="stChatInput"]');
-#     if (!chatInput) return;
-#     const microphone = [...chatInput.querySelectorAll('button')].find(button =>
-#       /record|audio|microphone|voice/i.test(button.getAttribute('aria-label') || '')
-#     ) || chatInput.querySelector('button');
-#     if (!microphone || microphone.dataset.webSpeechHooked) return;
-#
-#     microphone.dataset.webSpeechHooked = 'true';
-#     microphone.addEventListener('click', event => {
-#       event.preventDefault();
-#       event.stopImmediatePropagation();
-#       if (listening) stopListening(); else startListening();
-#     }, true);
-#   }
-#
-#   new MutationObserver(hookMicrophone).observe(parentDocument.body, {
-#     childList: true, subtree: true
-#   });
-#   hookMicrophone();
-# })();
-# </script></body></html>
-# """, width=1, height=1, tab_index=-1)
+        st.markdown(
+            open_assistant_row(),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            message["content"]
+        )
+
+        st.markdown(
+            render_message_actions(),
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            close_assistant_row(),
+            unsafe_allow_html=True,
+        )
 
 
-# ---------------------------------------------------------
-# Native Streamlit chat input
-# ---------------------------------------------------------
+# ============================================================
+# NATIVE STREAMLIT CHAT INPUT
+# ============================================================
+
 submission = st.chat_input(
     "Ask anything",
-    # accept_audio and audio_sample_rate disabled along with STT — uncomment to re-enable
-    # accept_audio=True,
-    # audio_sample_rate=16000,
-    key="main_chat_input",  # <--- UNIQUE KEY ADDED HERE
+    key="main_chat_input",
 )
 
 
-# ---------------------------------------------------------
-# Process input
-# ---------------------------------------------------------
+# ============================================================
+# EXTRACT PROMPT
+# ============================================================
+
 prompt = ""
 
 if submission:
-    if hasattr(submission, "text"):
-        prompt = (submission.text or "").strip()
+
+    if hasattr(
+        submission,
+        "text",
+    ):
+
+        prompt = (
+            submission.text or ""
+        ).strip()
+
     else:
-        prompt = str(submission).strip()
+
+        prompt = str(
+            submission
+        ).strip()
 
 
-# ---------------------------------------------------------
-# Generate assistant response
-# ---------------------------------------------------------
+# ============================================================
+# PROCESS USER QUESTION
+# ============================================================
+
 if prompt:
+
+    # --------------------------------------------------------
+    # Check API key
+    # --------------------------------------------------------
+
     if not GROQ_API_KEY:
-        st.error("No GROQ_API_KEY configured in your .env file.")
+
+        st.error(
+            "No GROQ_API_KEY configured in your .env file."
+        )
+
         st.stop()
 
-    # Save the user message
-    messages = append_message("user", prompt)
 
-    st.markdown(render_user_message(prompt, messages[-1].get("timestamp", "")), unsafe_allow_html=True)
+    # --------------------------------------------------------
+    # Save user message
+    # --------------------------------------------------------
 
-    # Retrieve relevant information from the vector database
-    rag_context = get_relevant_context(prompt, k=3)
+    messages = append_message(
+        "user",
+        prompt,
+    )
 
-    with st.expander("🔎 Retrieved Document Context"):
-        st.write(rag_context)
+    st.markdown(
+        render_user_message(
+            prompt,
+            messages[-1].get(
+                "timestamp",
+                "",
+            ),
+        ),
+        unsafe_allow_html=True,
+    )
 
-    # Build the message sent to Groq
-    rag_prompt = f"""
-        Answer the user's question accurately.
 
-        There are two possible situations:
-
-        1. GENERAL QUESTION
-        If the question is general knowledge or unrelated to the user's documents,
-        answer using your normal knowledge.
-
-        2. DOCUMENT QUESTION
-        If the question asks about the user's documents, use ONLY the document
-        context provided below.
-
-        IMPORTANT:
-        - Do not invent facts from the documents.
-        - Do not assume that retrieved text is relevant just because it was retrieved.
-        - If the retrieved context does not actually answer the document-related
-        question, say that the documents do not contain enough information.
-        - Do not use general knowledge to fill missing information when the user
-        explicitly asks what the documents say.
-        - For general questions, completely ignore the document context if it is
-        irrelevant.
-
-        --- RETRIEVED DOCUMENT CONTEXT ---
-        {rag_context if rag_context else "NO RELEVANT DOCUMENT CONTEXT WAS FOUND."}
-        --- END DOCUMENT CONTEXT ---
-
-        USER QUESTION:
-        {prompt}
-        """
-
-    api_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *[
-            {"role": message["role"], "content": message["content"]}
-            for message in messages[:-1]
-        ],
-        {"role": "user", "content": rag_prompt},
-    ]
-
-    full_response = ""
-    response_succeeded = False
-    error_message = None
-
-    st.markdown(open_assistant_row(), unsafe_allow_html=True)
-    placeholder = st.empty()
+    # ========================================================
+    # STEP 1 — CLASSIFY QUESTION
+    # ========================================================
 
     try:
+
+        question_type = classify_question(
+            prompt
+        )
+
+    except Exception as error:
+
+        print(
+            f"Question router error: "
+            f"{type(error).__name__}: {error}"
+        )
+
+        # Safe fallback:
+        # if routing fails, treat the question as general
+        # rather than automatically injecting book context.
+        question_type = "GENERAL"
+
+
+    print(
+        f"Question type: {question_type}"
+    )
+
+
+    # ========================================================
+    # STEP 2 — RETRIEVE DOCUMENT CONTEXT ONLY IF NEEDED
+    # ========================================================
+
+    rag_context = ""
+
+    if question_type == "DOCUMENT":
+
+        rag_context = get_relevant_context(
+            prompt,
+            k=5,
+        )
+
+
+    # ========================================================
+    # OPTIONAL DEBUG DISPLAY
+    # ========================================================
+
+    if question_type == "DOCUMENT":
+
+        with st.expander(
+            "🔎 Retrieved Document Context"
+        ):
+
+            if rag_context:
+
+                st.write(
+                    rag_context
+                )
+
+            else:
+
+                st.write(
+                    "NO RELEVANT DOCUMENT CONTEXT WAS FOUND."
+                )
+
+
+    # ========================================================
+    # STEP 3 — BUILD GROQ PROMPT
+    # ========================================================
+
+    if question_type == "DOCUMENT":
+
+        # ----------------------------------------------------
+        # DOCUMENT QUESTION
+        # ----------------------------------------------------
+
+        if rag_context:
+
+            rag_prompt = f"""
+Answer the user's question using ONLY the retrieved
+document context below.
+
+The question is about the document.
+
+IMPORTANT:
+
+- Use only information supported by the retrieved context.
+- Do not use your general knowledge to fill missing information.
+- Do not invent facts.
+- Do not assume that every retrieved passage is relevant.
+- If the context does not contain enough information to answer
+  the question, explicitly say that the available document
+  context does not contain enough information.
+- Do not claim that something happened in the book unless the
+  retrieved context supports it.
+
+--- RETRIEVED DOCUMENT CONTEXT ---
+
+{rag_context}
+
+--- END RETRIEVED DOCUMENT CONTEXT ---
+
+USER QUESTION:
+
+{prompt}
+"""
+
+        else:
+
+            rag_prompt = f"""
+The user is asking a question about the document.
+
+However, the retrieval system did not find sufficiently
+relevant document context.
+
+Answer ONLY with a concise explanation that the available
+document context does not contain enough information to
+answer the question.
+
+Do NOT answer using general knowledge.
+
+USER QUESTION:
+
+{prompt}
+"""
+
+    else:
+
+        # ----------------------------------------------------
+        # GENERAL QUESTION
+        # ----------------------------------------------------
+
+        rag_prompt = f"""
+Answer the user's question normally using your general
+knowledge.
+
+This is a GENERAL question and is not about the document.
+
+IMPORTANT:
+
+- Do not use or mention the document.
+- Do not mention retrieval.
+- Do not mention RAG.
+- Answer naturally and directly.
+
+USER QUESTION:
+
+{prompt}
+"""
+
+
+    # ========================================================
+    # BUILD API MESSAGE HISTORY
+    # ========================================================
+
+    api_messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
+
+
+    # --------------------------------------------------------
+    # Include previous conversation
+    # --------------------------------------------------------
+
+    for message in messages[:-1]:
+
+        api_messages.append(
+            {
+                "role": message["role"],
+                "content": message["content"],
+            }
+        )
+
+
+    # --------------------------------------------------------
+    # Add current question
+    # --------------------------------------------------------
+
+    api_messages.append(
+        {
+            "role": "user",
+            "content": rag_prompt,
+        }
+    )
+
+
+    # ========================================================
+    # GENERATE ASSISTANT RESPONSE
+    # ========================================================
+
+    full_response = ""
+
+    response_succeeded = False
+
+    error_message = None
+
+
+    st.markdown(
+        open_assistant_row(),
+        unsafe_allow_html=True,
+    )
+
+    placeholder = st.empty()
+
+
+    try:
+
         client = get_groq_client()
+
         stream = client.chat.completions.create(
             model=CHAT_MODEL,
             messages=api_messages,
@@ -493,51 +888,122 @@ if prompt:
             stream=True,
         )
 
+
+        # ----------------------------------------------------
+        # Stream response
+        # ----------------------------------------------------
+
         for chunk in stream:
+
             if not chunk.choices:
                 continue
 
-            delta = chunk.choices[0].delta.content or ""
-            if delta:
-                full_response += delta
-                placeholder.markdown(full_response + "▌")
+            delta = (
+                chunk.choices[0]
+                .delta
+                .content
+                or ""
+            )
 
-        full_response = full_response.strip()
+            if delta:
+
+                full_response += delta
+
+                placeholder.markdown(
+                    full_response + "▌"
+                )
+
+
+        full_response = (
+            full_response.strip()
+        )
+
 
         if not full_response:
-            raise RuntimeError("The model returned an empty response.")
 
-        placeholder.markdown(full_response)
-        st.markdown(render_message_actions(), unsafe_allow_html=True)
+            raise RuntimeError(
+                "The model returned an empty response."
+            )
+
+
+        placeholder.markdown(
+            full_response
+        )
+
+        st.markdown(
+            render_message_actions(),
+            unsafe_allow_html=True,
+        )
+
         response_succeeded = True
 
+
     except Exception as error:
+
         placeholder.empty()
+
         error_message = str(error)
-        print(f"Groq chat error: {type(error).__name__}: {error}")
+
+        print(
+            f"Groq chat error: "
+            f"{type(error).__name__}: {error}"
+        )
+
 
     finally:
-        st.markdown(close_assistant_row(), unsafe_allow_html=True)
+
+        st.markdown(
+            close_assistant_row(),
+            unsafe_allow_html=True,
+        )
+
+
+    # ========================================================
+    # ERROR DISPLAY
+    # ========================================================
 
     if error_message:
-        st.error(f"AI Response failed: {error_message}")
 
-        # Show the prompt that was sent for debugging
-        with st.expander("🔍 Debug Info"):
-            st.write("**Prompt sent to AI:**")
-            st.code(prompt)
-            st.write("**Messages sent:**")
-            st.json(api_messages)
+        st.error(
+            f"AI Response failed: {error_message}"
+        )
+
+        with st.expander(
+            "🔍 Debug Info"
+        ):
+
+            st.write(
+                "**Question type:**"
+            )
+
+            st.code(
+                question_type
+            )
+
+            st.write(
+                "**Prompt sent to AI:**"
+            )
+
+            st.code(
+                prompt
+            )
+
+            st.write(
+                "**Messages sent:**"
+            )
+
+            st.json(
+                api_messages
+            )
+
+
+    # ========================================================
+    # SAVE ASSISTANT RESPONSE
+    # ========================================================
 
     if response_succeeded:
-        append_message("assistant", full_response)
 
-        # Voice response disabled for now — uncomment to re-enable Edge TTS playback
-        # try:
-        #     audio_chunks = generate_edge_tts_audio(full_response)
-        #     for index, audio in enumerate(audio_chunks):
-        #         st.audio(audio, format="audio/mp3", autoplay=(index == 0))
-        #     st.caption("🔊 Voice response (Edge TTS - Free)")
-        # except Exception as error:
-        #     print(f"TTS error: {type(error).__name__}: {error}")
-        #     st.info("💬 Voice generation unavailable, but text response is above.")
+        append_message(
+            "assistant",
+            full_response,
+        )
