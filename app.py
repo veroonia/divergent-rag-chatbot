@@ -53,32 +53,15 @@ HISTORY_LOCK = threading.RLock()
 # Model used for routing / query rewriting (cheap, simple tasks).
 CHAT_MODEL = "openai/gpt-oss-20b"
 
-# Model used for the actual final answer.
-# Document QA requires careful multi-passage, multi-hop reading
-# (e.g. tracking who said what about whom across several family
-# members) — this is a genuine reasoning-capacity requirement,
-# not just a prompt-wording issue. openai/gpt-oss-20b was
-# repeatedly misattributing quotes even with correct retrieval
-# and explicit instructions, so this is bumped to the much
-# larger 120b model. llama-3.3-70b-versatile is deprecated on
-# Groq as of mid-2026; gpt-oss-120b is the recommended successor.
-#
-# NOTE: gpt-oss-120b has built-in reasoning. Test that streamed
-# output is clean prose and doesn't leak raw reasoning tokens
-# into what the user sees — if it does, check Groq's docs for a
-# reasoning_effort / reasoning_format parameter to suppress it.
 ANSWER_MODEL = "openai/gpt-oss-120b"
 
 # General conversation can be a bit more creative/loose.
 GENERAL_TEMPERATURE = 0.7
 
 # Document answers must be a careful, literal reading of the
-# retrieved passages — not creative. Keep this at 0 unless you
-# have a specific reason to raise it.
 DOCUMENT_TEMPERATURE = 0.0
 
 # Maximum answer length.
-# This is intentionally much larger than the router's limit.
 MAX_ANSWER_TOKENS = 1800
 
 # Number of retrieved chunks.
@@ -783,13 +766,6 @@ GENERAL
 # ============================================================
 # DOCUMENT QUESTION SUBTYPE DETECTOR
 # ============================================================
-
-# rag_retriever.py has term-expansion and reranking logic keyed
-# off a question subtype ("origin", "motivation", "character",
-# "event") but nothing was ever detecting or passing that value.
-# This is a cheap keyword heuristic — it only needs to be roughly
-# right, since it feeds query expansion and a secondary rerank
-# signal, not the final answer.
 
 ORIGIN_SIGNALS = [
     "born",
