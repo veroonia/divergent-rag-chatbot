@@ -50,9 +50,39 @@ HISTORY_FILE = "chat_history.json"
 
 HISTORY_LOCK = threading.RLock()
 
+# Model used for routing / query rewriting (cheap, simple tasks).
 CHAT_MODEL = "openai/gpt-oss-20b"
 
-TEMPERATURE = 0.7
+# Model used for the actual final answer.
+# Document QA requires careful multi-passage, multi-hop reading
+# (e.g. tracking who said what about whom across several family
+# members) — this is a genuine reasoning-capacity requirement,
+# not just a prompt-wording issue. openai/gpt-oss-20b was
+# repeatedly misattributing quotes even with correct retrieval
+# and explicit instructions, so this is bumped to the much
+# larger 120b model. llama-3.3-70b-versatile is deprecated on
+# Groq as of mid-2026; gpt-oss-120b is the recommended successor.
+#
+# NOTE: gpt-oss-120b has built-in reasoning. Test that streamed
+# output is clean prose and doesn't leak raw reasoning tokens
+# into what the user sees — if it does, check Groq's docs for a
+# reasoning_effort / reasoning_format parameter to suppress it.
+ANSWER_MODEL = "openai/gpt-oss-120b"
+
+# General conversation can be a bit more creative/loose.
+GENERAL_TEMPERATURE = 0.7
+
+# Document answers must be a careful, literal reading of the
+# retrieved passages — not creative. Keep this at 0 unless you
+# have a specific reason to raise it.
+DOCUMENT_TEMPERATURE = 0.0
+
+# Maximum answer length.
+# This is intentionally much larger than the router's limit.
+MAX_ANSWER_TOKENS = 1800
+
+# Number of retrieved chunks.
+RETRIEVAL_K = 8
 
 
 # ============================================================
@@ -60,123 +90,282 @@ TEMPERATURE = 0.7
 # ============================================================
 
 SYSTEM_PROMPT = """
-You are a helpful, accurate, and concise AI assistant.
+You are a helpful, accurate AI assistant.
 
-You can answer two types of questions.
+You can answer two different kinds of questions:
 
 1. GENERAL QUESTIONS
+2. DOCUMENT QUESTIONS ABOUT THE NOVEL "DIVERGENT"
 
-If the user asks a general knowledge question that is
-unrelated to the document, answer normally using your
-general knowledge.
+============================================================
+GENERAL QUESTIONS
+============================================================
 
-2. DOCUMENT QUESTIONS
+For general questions, answer normally using your general
+knowledge.
 
-If the user asks about the document, use ONLY the
-retrieved document context provided in the current request.
+Do NOT use the Divergent document context for general questions.
 
-IMPORTANT RULES FOR DOCUMENT QUESTIONS:
+Do NOT mention:
+- the document
+- retrieval
+- RAG
+- Qdrant
+- document context
+- routing
 
-- Do not use general knowledge to fill missing information.
-- Do not invent facts from the document.
-- Do not assume that a retrieved passage answers the question.
-- Only state information that is supported by the retrieved
-  document context.
-- If the retrieved context does not contain enough information
-  to answer the question, explicitly say that the available
-  document context does not contain enough information.
-- Never claim that something appears in the document unless
-  the retrieved context supports it.
-- Be concise and directly answer the user's question.
+Answer naturally as a normal general-purpose AI assistant.
 
-For general questions, completely ignore the document context.
+Give enough detail to properly answer the question.
+
+For simple factual questions, a short answer is fine.
+
+For broader questions, normally provide:
+- a direct answer first
+- useful explanation
+- examples or relevant details when appropriate
+
+Do not unnecessarily restrict general answers to one or two
+sentences.
+
+============================================================
+DOCUMENT QUESTIONS
+============================================================
+
+For questions about Divergent, use ONLY the retrieved document
+context supplied in the current request.
+
+Do not use general knowledge to fill gaps.
+
+Do not invent information.
+
+NOVEL-SPECIFIC VOCABULARY:
+
+The book uses specific terms to describe a character's faction
+history. Read these literally as direct, explicit statements of
+fact — not as something requiring extra inference:
+
+- A character called a "[Faction] transfer" (e.g. "an Abnegation
+  transfer," "a Dauntless transfer," "the only Abnegation
+  transfer") was BORN AND RAISED in that named faction, then
+  chose to leave it for a new faction at the Choosing Ceremony.
+  This directly states their birth/origin faction. Treat it the
+  same as if the text said "born into [Faction]."
+- A character called "[Faction]-born" (e.g. "Dauntless-born")
+  was born and raised in that faction and did NOT transfer away
+  from it.
+- The "Choosing Ceremony" is the event at age sixteen where each
+  person selects the faction they will belong to for the rest of
+  their life — which may or may not match the faction they were
+  born into.
+
+When a retrieved passage uses this vocabulary, use it directly
+to answer origin/background questions. Reading this vocabulary
+literally is reading the text, not making an unsupported
+inference.
+
+Do not assume that a retrieved passage answers the question.
+
+Only state information that is actually supported by the
+retrieved context.
+
+Before using any quote or paraphrasing any passage, identify
+exactly WHO is speaking and WHO or WHAT the passage is actually
+describing. Characters frequently describe someone else's
+faction, history, background, or actions — never assume a
+passage describes the person the question is about just because
+it appears in a relevant retrieved chunk. Trace pronouns and
+dialogue attribution carefully before drawing a conclusion.
+
+If several retrieved passages address the question, prioritize
+the most explicit, directly-stated passage over an ambiguous
+line of dialogue that requires guessing who or what is being
+discussed. Do not build an answer around the ambiguous line if
+a clearer passage is available.
+
+If passages appear to conflict, do not silently pick one and
+present it as certain. State what the clearest, most explicit
+passages say, and only mention the ambiguous or conflicting line
+if it's needed to explain the discrepancy.
+
+If the retrieved context does not contain enough information,
+say clearly:
+
+"The available document context does not contain enough
+information to answer that question."
+
+Do not answer the question from your general knowledge when
+the retrieved context is insufficient.
+
+When the context does support the answer, answer directly and
+naturally.
+
+You may combine information from multiple retrieved passages
+when they collectively support the answer.
+
+============================================================
+IMPORTANT
+============================================================
+
+Always determine the response type from the instructions in
+the current request.
+
+If the current request says GENERAL, ignore any document
+context completely.
+
+If the current request says DOCUMENT, use only the supplied
+retrieved context.
 """
 
 
 # ============================================================
-# DOCUMENT ROUTING PROMPT
+# ROUTER PROMPT
 # ============================================================
 
 ROUTER_PROMPT = """
-You are a question router for a chatbot that has access to
-the novel "Divergent".
+You are a routing classifier for a chatbot that has access to
+the complete novel "Divergent" through a retrieval system.
 
-Your job is to classify the user's question into exactly
-ONE of these two categories:
+Your job is to classify the CURRENT user question into exactly
+one category:
 
 DOCUMENT
+or
 GENERAL
 
-Return ONLY the word:
+============================================================
+DOCUMENT
+============================================================
+
+Choose DOCUMENT when the user is asking for information that
+should come from the novel Divergent.
+
+This includes questions about:
+
+- Tris
+- Beatrice Prior
+- Tobias
+- Four
+- Christina
+- Caleb
+- Peter
+- Jeanine
+- Eric
+- Al
+- Will
+- Uriah
+- characters
+- relationships
+- family
+- factions
+- Abnegation
+- Dauntless
+- Erudite
+- Amity
+- Candor
+- factionless
+- initiation
+- aptitude tests
+- choosing ceremony
+- fear landscapes
+- Divergence
+- plot
+- events
+- scenes
+- chapters
+- dialogue
+- character motivations
+- character decisions
+- locations in the novel
+- anything that happened in the story
+
+Also classify as DOCUMENT when the question is a follow-up to
+an earlier Divergent question.
+
+Examples:
+
+User:
+Who is Tris?
+DOCUMENT
+
+User:
+Why did she choose Dauntless?
+DOCUMENT
+
+User:
+What about her mother?
+DOCUMENT
+
+User:
+Why did he do that?
+DOCUMENT
+
+User:
+What happened next?
+DOCUMENT
+
+============================================================
+GENERAL
+============================================================
+
+Choose GENERAL when the question can be answered independently
+of Divergent.
+
+Examples:
+
+What is the capital of France?
+GENERAL
+
+Tell me more about Paris.
+GENERAL
+
+What are the top places to visit in Paris?
+GENERAL
+
+How does photosynthesis work?
+GENERAL
+
+Explain machine learning.
+GENERAL
+
+Write Python code for a calculator.
+GENERAL
+
+============================================================
+IMPORTANT
+============================================================
+
+Use the recent conversation to resolve pronouns and references.
+
+Words such as:
+
+she
+he
+her
+him
+they
+it
+that
+there
+why did she
+what happened next
+what about him
+
+should be classified as DOCUMENT if the recent conversation
+clearly established that they refer to a Divergent character,
+event, or concept.
+
+However, do NOT classify a question as DOCUMENT merely because
+an unrelated earlier conversation happened to mention a Divergent
+term.
+
+Return ONLY:
 
 DOCUMENT
 
 or:
 
 GENERAL
-
-
-Choose DOCUMENT when the user is asking about:
-
-- Divergent
-- Tris
-- Beatrice Prior
-- Four
-- Tobias
-- Christina
-- Caleb
-- Peter
-- Dauntless
-- Abnegation
-- Erudite
-- Amity
-- Candor
-- factions
-- initiation
-- the characters
-- events in the novel
-- chapters
-- scenes
-- relationships between characters
-- anything that clearly refers to the contents of the book
-
-
-Choose GENERAL when the question is unrelated to the novel.
-
-Examples:
-
-"What is the capital of France?"
-GENERAL
-
-"Give me five places to visit in Cairo."
-GENERAL
-
-"How does photosynthesis work?"
-GENERAL
-
-"What faction was Tris born into?"
-DOCUMENT
-
-"Why does Tris choose Dauntless?"
-DOCUMENT
-
-"Who is Four?"
-DOCUMENT
-
-"What happens during Tris's initiation?"
-DOCUMENT
-
-"Who is Tris's mother?"
-DOCUMENT
-
-
-Important:
-
-If the question clearly refers to a character, event,
-location, faction, chapter, or other element of Divergent,
-classify it as DOCUMENT.
-
-Return ONLY DOCUMENT or GENERAL.
 """
 
 
@@ -193,7 +382,6 @@ def _is_valid_history(data):
         return False
 
     for item in data:
-
         if not isinstance(item, dict):
             return False
 
@@ -370,68 +558,453 @@ def get_groq_client():
 
 
 # ============================================================
+# CONVERSATION FORMATTER
+# ============================================================
+
+def format_recent_conversation(
+    conversation_history,
+    limit=8,
+):
+    """
+    Format only the most recent messages for routing and
+    retrieval-query rewriting.
+    """
+
+    if not conversation_history:
+        return "No previous conversation."
+
+    recent_messages = conversation_history[-limit:]
+
+    parts = []
+
+    for message in recent_messages:
+
+        role = message.get(
+            "role",
+            "",
+        ).upper()
+
+        content = message.get(
+            "content",
+            "",
+        )
+
+        if not content:
+            continue
+
+        parts.append(
+            f"{role}: {content}"
+        )
+
+    if not parts:
+        return "No previous conversation."
+
+    return "\n".join(parts)
+
+
+# ============================================================
 # QUESTION ROUTER
 # ============================================================
 
-def classify_question(prompt):
+def classify_question(
+    prompt,
+    conversation_history=None,
+):
     """
-    Decide whether the question is about Divergent
-    or is a general question.
+    Determine whether a question is about Divergent or general.
 
-    Returns:
-
-        "DOCUMENT"
-
-    or:
-
-        "GENERAL"
+    Uses:
+    1. Strong Divergent-specific terms.
+    2. Recent conversation context.
+    3. LLM classification for ambiguous cases.
     """
 
-    client = get_groq_client()
-
-    response = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": ROUTER_PROMPT,
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        temperature=0,
-        max_tokens=10,
-    )
-
-    result = (
-        response.choices[0]
-        .message
-        .content
-        .strip()
-        .upper()
-    )
-
-    # --------------------------------------------------------
-    # Keep only the expected classifications
-    # --------------------------------------------------------
-
-    if "DOCUMENT" in result:
-        return "DOCUMENT"
-
-    if "GENERAL" in result:
+    if not prompt or not prompt.strip():
         return "GENERAL"
 
-    # --------------------------------------------------------
-    # Safe fallback
-    # --------------------------------------------------------
+    prompt_lower = prompt.lower().strip()
 
-    print(
-        f"Unexpected router result: {result}"
-    )
+    # ========================================================
+    # STRONG DOCUMENT TERMS
+    # ========================================================
+
+    divergent_terms = [
+        "divergent",
+        "tris",
+        "beatrice",
+        "beatrice prior",
+        "tobias",
+        "four",
+        "christina",
+        "caleb",
+        "peter",
+        "jeanine",
+        "eric",
+        "al",
+        "will",
+        "uriah",
+        "dauntless",
+        "abnegation",
+        "erudite",
+        "amity",
+        "candor",
+        "faction",
+        "factions",
+        "factionless",
+        "initiation",
+        "initiate",
+        "aptitude test",
+        "choosing ceremony",
+        "fear landscape",
+        "fear simulation",
+        "divergence",
+        "divergent serum",
+        "dauntless-born",
+    ]
+
+    for term in divergent_terms:
+
+        if term in prompt_lower:
+
+            print(
+                f"Document keyword detected: {term}"
+            )
+
+            return "DOCUMENT"
+
+    # ========================================================
+    # RECENT CONVERSATION
+    # ========================================================
+
+    conversation_text = format_recent_conversation(
+        conversation_history,
+        limit=8,
+    ).lower()
+
+    recent_document_signal = False
+
+    for term in divergent_terms:
+
+        if term in conversation_text:
+
+            recent_document_signal = True
+            break
+
+    # ========================================================
+    # LLM ROUTER
+    # ========================================================
+
+    try:
+
+        client = get_groq_client()
+
+        router_input = f"""
+RECENT CONVERSATION:
+
+{format_recent_conversation(
+    conversation_history,
+    limit=8,
+)}
+
+CURRENT USER QUESTION:
+
+{prompt}
+
+Classify the CURRENT question.
+
+Return exactly one word:
+
+DOCUMENT
+
+or
+
+GENERAL
+"""
+
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": ROUTER_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": router_input,
+                },
+            ],
+            temperature=0,
+            max_tokens=20,
+        )
+
+        result = (
+            response.choices[0]
+            .message
+            .content
+            .strip()
+            .upper()
+        )
+
+        print(
+            f"LLM router result: {result}"
+        )
+
+        if result == "DOCUMENT":
+            return "DOCUMENT"
+
+        if result == "GENERAL":
+            return "GENERAL"
+
+        # Sometimes models return extra text.
+        if "DOCUMENT" in result:
+            return "DOCUMENT"
+
+        if "GENERAL" in result:
+            return "GENERAL"
+
+    except Exception as error:
+
+        print(
+            f"Question router error: "
+            f"{type(error).__name__}: {error}"
+        )
+
+    # ========================================================
+    # SAFE FALLBACK
+    # ========================================================
+
+    if recent_document_signal:
+
+        return "DOCUMENT"
 
     return "GENERAL"
+
+
+# ============================================================
+# DOCUMENT QUESTION SUBTYPE DETECTOR
+# ============================================================
+
+# rag_retriever.py has term-expansion and reranking logic keyed
+# off a question subtype ("origin", "motivation", "character",
+# "event") but nothing was ever detecting or passing that value.
+# This is a cheap keyword heuristic — it only needs to be roughly
+# right, since it feeds query expansion and a secondary rerank
+# signal, not the final answer.
+
+ORIGIN_SIGNALS = [
+    "born",
+    "birth",
+    "family",
+    "grew up",
+    "growing up",
+    "upbringing",
+    "originally",
+    "original faction",
+    "childhood",
+    "raised",
+]
+
+MOTIVATION_SIGNALS = [
+    "why",
+    "reason",
+    "decision",
+    "chose",
+    "choose",
+    "motivation",
+    "wanted",
+]
+
+CHARACTER_SIGNALS = [
+    "feel",
+    "feels",
+    "felt",
+    "believe",
+    "relationship",
+    "personality",
+    "trait",
+    "think",
+    "thinks",
+    "thought",
+]
+
+EVENT_SIGNALS = [
+    "what happened",
+    "when did",
+    "where did",
+    "event",
+    "scene",
+    "incident",
+]
+
+
+def detect_question_subtype(prompt):
+    """
+    Best-effort keyword classification into one of the subtypes
+    rag_retriever.py already knows how to expand/rerank for.
+
+    Returns None when nothing matches — get_relevant_context
+    handles that fine, it just skips the extra expansion.
+    """
+
+    prompt_lower = prompt.lower()
+
+    for term in ORIGIN_SIGNALS:
+        if term in prompt_lower:
+            return "origin"
+
+    for term in MOTIVATION_SIGNALS:
+        if term in prompt_lower:
+            return "motivation"
+
+    for term in CHARACTER_SIGNALS:
+        if term in prompt_lower:
+            return "character"
+
+    for term in EVENT_SIGNALS:
+        if term in prompt_lower:
+            return "event"
+
+    return None
+
+
+# ============================================================
+# RETRIEVAL QUERY REWRITER
+# ============================================================
+
+def create_retrieval_query(
+    prompt,
+    conversation_history=None,
+):
+    """
+    Convert a natural user question into a retrieval-friendly
+    query.
+
+    This is especially useful for questions such as:
+
+        "what faction was Tris born into?"
+
+    which should become something closer to:
+
+        "Tris Beatrice Prior original birth faction
+        family faction before choosing Dauntless"
+
+    The rewritten query is ONLY used for vector retrieval.
+    The original user question is still sent to the final model.
+    """
+
+    if not prompt:
+        return prompt
+
+    try:
+
+        client = get_groq_client()
+
+        conversation_text = format_recent_conversation(
+            conversation_history,
+            limit=6,
+        )
+
+        rewrite_prompt = f"""
+You are preparing a search query for a vector database
+containing the complete novel Divergent.
+
+Rewrite the user's question into a concise retrieval query.
+
+Your goal is to find the exact passages that answer the question.
+
+Preserve:
+- character names
+- relationships
+- events
+- locations
+- factions
+- chapter concepts
+- motivations
+- temporal clues
+- origin/background information
+
+Resolve pronouns using the conversation when possible.
+
+For example:
+
+User question:
+"What faction was Tris born into?"
+
+Good retrieval query:
+"Tris Beatrice Prior original faction birth faction
+family faction before transferring to Dauntless"
+
+Another example:
+
+User question:
+"Why did she choose it?"
+
+If the conversation shows that "she" means Tris and "it"
+means Dauntless, produce a query containing those explicit terms.
+
+Do NOT answer the question.
+
+Return ONLY the retrieval query.
+
+RECENT CONVERSATION:
+{conversation_text}
+
+USER QUESTION:
+{prompt}
+"""
+
+        response = client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You rewrite questions for semantic "
+                        "document retrieval. Return only the "
+                        "rewritten search query."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": rewrite_prompt,
+                },
+            ],
+            temperature=0,
+            max_tokens=150,
+        )
+
+        rewritten = (
+            response.choices[0]
+            .message
+            .content
+            .strip()
+        )
+
+        if rewritten:
+
+            print(
+                "Original retrieval query:"
+            )
+
+            print(prompt)
+
+            print(
+                "Rewritten retrieval query:"
+            )
+
+            print(rewritten)
+
+            return rewritten
+
+    except Exception as error:
+
+        print(
+            f"Retrieval query rewrite error: "
+            f"{type(error).__name__}: {error}"
+        )
+
+    # Safe fallback.
+    return prompt
 
 
 # ============================================================
@@ -446,10 +1019,12 @@ def load_css():
         .joinpath("app.css")
     )
 
-    st.markdown(
-        f"<style>{css_path.read_text(encoding='utf-8')}</style>",
-        unsafe_allow_html=True,
-    )
+    if css_path.exists():
+
+        st.markdown(
+            f"<style>{css_path.read_text(encoding='utf-8')}</style>",
+            unsafe_allow_html=True,
+        )
 
 
 load_css()
@@ -464,7 +1039,7 @@ def render_hero():
     return """
     <div class="hero">
         <h1>How can I help you?</h1>
-        <p>Ask me anything about your documents.</p>
+        <p>Ask me anything.</p>
     </div>
     """
 
@@ -509,9 +1084,7 @@ with top_bar:
 
     with right:
 
-        messages_for_button = (
-            load_history()
-        )
+        messages_for_button = load_history()
 
         if st.button(
             "Clear",
@@ -597,7 +1170,7 @@ for message in messages:
 
 
 # ============================================================
-# NATIVE STREAMLIT CHAT INPUT
+# CHAT INPUT
 # ============================================================
 
 submission = st.chat_input(
@@ -636,9 +1209,9 @@ if submission:
 
 if prompt:
 
-    # --------------------------------------------------------
-    # Check API key
-    # --------------------------------------------------------
+    # ========================================================
+    # CHECK API KEY
+    # ========================================================
 
     if not GROQ_API_KEY:
 
@@ -648,10 +1221,9 @@ if prompt:
 
         st.stop()
 
-
-    # --------------------------------------------------------
-    # Save user message
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE USER MESSAGE
+    # ========================================================
 
     messages = append_message(
         "user",
@@ -669,51 +1241,86 @@ if prompt:
         unsafe_allow_html=True,
     )
 
-
     # ========================================================
-    # STEP 1 — CLASSIFY QUESTION
+    # STEP 1 — CLASSIFY
     # ========================================================
 
     try:
 
         question_type = classify_question(
-            prompt
+            prompt,
+            conversation_history=messages[:-1],
         )
 
     except Exception as error:
 
         print(
-            f"Question router error: "
+            f"Question classification error: "
             f"{type(error).__name__}: {error}"
         )
 
-        # Safe fallback:
-        # if routing fails, treat the question as general
-        # rather than automatically injecting book context.
         question_type = "GENERAL"
-
 
     print(
         f"Question type: {question_type}"
     )
 
-
     # ========================================================
-    # STEP 2 — RETRIEVE DOCUMENT CONTEXT ONLY IF NEEDED
+    # STEP 2 — DOCUMENT RETRIEVAL
     # ========================================================
 
     rag_context = ""
 
+    retrieval_query = prompt
+
+    question_subtype = None
+
     if question_type == "DOCUMENT":
 
-        rag_context = get_relevant_context(
-            prompt,
-            k=5,
+        # ----------------------------------------------------
+        # Detect origin / motivation / character / event so
+        # rag_retriever.py's term-expansion and reranking logic
+        # for that subtype actually gets used.
+        # ----------------------------------------------------
+
+        question_subtype = detect_question_subtype(prompt)
+
+        print(
+            f"Question subtype: {question_subtype}"
         )
 
+        # ----------------------------------------------------
+        # Rewrite query specifically for retrieval.
+        # ----------------------------------------------------
+
+        retrieval_query = create_retrieval_query(
+            prompt,
+            conversation_history=messages[:-1],
+        )
+
+        # ----------------------------------------------------
+        # Retrieve from Qdrant.
+        # ----------------------------------------------------
+
+        try:
+
+            rag_context = get_relevant_context(
+                retrieval_query,
+                k=RETRIEVAL_K,
+                question_type=question_subtype,
+            )
+
+        except Exception as error:
+
+            print(
+                f"Retrieval error: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            rag_context = ""
 
     # ========================================================
-    # OPTIONAL DEBUG DISPLAY
+    # DEBUG INFORMATION
     # ========================================================
 
     if question_type == "DOCUMENT":
@@ -721,6 +1328,30 @@ if prompt:
         with st.expander(
             "🔎 Retrieved Document Context"
         ):
+
+            st.write(
+                "**Original question:**"
+            )
+
+            st.write(prompt)
+
+            st.write(
+                "**Detected subtype:**"
+            )
+
+            st.write(
+                question_subtype or "None"
+            )
+
+            st.write(
+                "**Retrieval query:**"
+            )
+
+            st.write(retrieval_query)
+
+            st.write(
+                "**Context:**"
+            )
 
             if rag_context:
 
@@ -734,42 +1365,63 @@ if prompt:
                     "NO RELEVANT DOCUMENT CONTEXT WAS FOUND."
                 )
 
-
     # ========================================================
-    # STEP 3 — BUILD GROQ PROMPT
+    # STEP 3 — BUILD FINAL PROMPT
     # ========================================================
 
     if question_type == "DOCUMENT":
 
-        # ----------------------------------------------------
-        # DOCUMENT QUESTION
-        # ----------------------------------------------------
-
         if rag_context:
 
-            rag_prompt = f"""
-Answer the user's question using ONLY the retrieved
-document context below.
+            final_prompt = f"""
+The user is asking a question about the novel Divergent.
 
-The question is about the document.
+Answer the user's question using ONLY the retrieved document
+context below.
 
-IMPORTANT:
+IMPORTANT RULES:
 
 - Use only information supported by the retrieved context.
-- Do not use your general knowledge to fill missing information.
+- Do not use outside knowledge.
 - Do not invent facts.
+- Remember: "[Faction] transfer" means born/raised in that
+  faction, then left it. "[Faction]-born" means born, raised,
+  and stayed in that faction. Treat these terms as explicit
+  statements of origin, not inferences.
 - Do not assume that every retrieved passage is relevant.
-- If the context does not contain enough information to answer
-  the question, explicitly say that the available document
-  context does not contain enough information.
-- Do not claim that something happened in the book unless the
-  retrieved context supports it.
+- Carefully compare the passages and identify which ones
+  actually answer the question.
+- Before using any quote or paraphrasing any passage, identify
+  exactly WHO is speaking and WHO or WHAT the passage is
+  actually describing. Characters frequently describe someone
+  else's faction, history, background, or actions — never
+  assume a passage describes the person the question is about
+  just because it was retrieved as relevant. Trace pronouns and
+  dialogue attribution carefully before drawing a conclusion.
+- If several passages address the question, prioritize the most
+  explicit, directly-stated passage over an ambiguous line of
+  dialogue that requires guessing who or what is being
+  discussed. Do not build the answer around the ambiguous line
+  if a clearer passage is available.
+- You may combine information from multiple retrieved passages
+  when they collectively support the answer.
+- If passages appear to conflict, do not silently pick one and
+  present it as certain. State what the clearest, most explicit
+  passages say, and only mention the ambiguous or conflicting
+  line if it's needed to explain the discrepancy.
+- If the retrieved passages do not actually provide enough
+  information to answer the question, say so explicitly.
+- Do not pretend that an inference is explicitly stated in
+  the book.
+- Answer naturally and directly.
+- Do not mention RAG, Qdrant, retrieval, embeddings, or the
+  retrieval process.
 
---- RETRIEVED DOCUMENT CONTEXT ---
+RETRIEVED DOCUMENT CONTEXT:
 
 {rag_context}
 
---- END RETRIEVED DOCUMENT CONTEXT ---
+END RETRIEVED DOCUMENT CONTEXT.
 
 USER QUESTION:
 
@@ -778,17 +1430,15 @@ USER QUESTION:
 
         else:
 
-            rag_prompt = f"""
-The user is asking a question about the document.
+            final_prompt = f"""
+The user is asking about the novel Divergent.
 
-However, the retrieval system did not find sufficiently
-relevant document context.
-
-Answer ONLY with a concise explanation that the available
-document context does not contain enough information to
-answer the question.
+No sufficiently relevant document context was retrieved.
 
 Do NOT answer using general knowledge.
+
+Respond only that the available document context does not
+contain enough information to answer the question.
 
 USER QUESTION:
 
@@ -797,31 +1447,33 @@ USER QUESTION:
 
     else:
 
-        # ----------------------------------------------------
-        # GENERAL QUESTION
-        # ----------------------------------------------------
+        final_prompt = f"""
+This is a GENERAL question.
 
-        rag_prompt = f"""
-Answer the user's question normally using your general
-knowledge.
-
-This is a GENERAL question and is not about the document.
+Answer it normally using your general knowledge.
 
 IMPORTANT:
 
-- Do not use or mention the document.
+- Completely ignore any Divergent document.
+- Do not use document context.
+- Do not mention documents.
 - Do not mention retrieval.
 - Do not mention RAG.
+- Do not mention this classification.
 - Answer naturally and directly.
+- Give enough detail to properly answer the question.
+- Do not unnecessarily limit the answer to one or two sentences.
+- For broad questions, provide a useful explanation and relevant
+  details.
+- For simple factual questions, remain concise.
 
 USER QUESTION:
 
 {prompt}
 """
 
-
     # ========================================================
-    # BUILD API MESSAGE HISTORY
+    # STEP 4 — BUILD API MESSAGES
     # ========================================================
 
     api_messages = [
@@ -831,12 +1483,16 @@ USER QUESTION:
         }
     ]
 
-
     # --------------------------------------------------------
-    # Include previous conversation
+    # Add recent conversation history.
+    #
+    # This allows the model to understand follow-up questions
+    # without sending an unnecessarily huge history.
     # --------------------------------------------------------
 
-    for message in messages[:-1]:
+    recent_messages = messages[:-1][-8:]
+
+    for message in recent_messages:
 
         api_messages.append(
             {
@@ -845,21 +1501,19 @@ USER QUESTION:
             }
         )
 
-
     # --------------------------------------------------------
-    # Add current question
+    # Current question / instructions.
     # --------------------------------------------------------
 
     api_messages.append(
         {
             "role": "user",
-            "content": rag_prompt,
+            "content": final_prompt,
         }
     )
 
-
     # ========================================================
-    # GENERATE ASSISTANT RESPONSE
+    # STEP 5 — GENERATE RESPONSE
     # ========================================================
 
     full_response = ""
@@ -868,7 +1522,6 @@ USER QUESTION:
 
     error_message = None
 
-
     st.markdown(
         open_assistant_row(),
         unsafe_allow_html=True,
@@ -876,18 +1529,29 @@ USER QUESTION:
 
     placeholder = st.empty()
 
+    # --------------------------------------------------------
+    # Document answers use a low, near-deterministic temperature
+    # since careful literal reading matters more than variety.
+    # General chat keeps the looser temperature.
+    # --------------------------------------------------------
+
+    answer_temperature = (
+        DOCUMENT_TEMPERATURE
+        if question_type == "DOCUMENT"
+        else GENERAL_TEMPERATURE
+    )
 
     try:
 
         client = get_groq_client()
 
         stream = client.chat.completions.create(
-            model=CHAT_MODEL,
+            model=ANSWER_MODEL,
             messages=api_messages,
-            temperature=TEMPERATURE,
+            temperature=answer_temperature,
+            max_tokens=MAX_ANSWER_TOKENS,
             stream=True,
         )
-
 
         # ----------------------------------------------------
         # Stream response
@@ -913,18 +1577,19 @@ USER QUESTION:
                     full_response + "▌"
                 )
 
-
         full_response = (
             full_response.strip()
         )
 
+        # ----------------------------------------------------
+        # Empty response protection
+        # ----------------------------------------------------
 
         if not full_response:
 
             raise RuntimeError(
                 "The model returned an empty response."
             )
-
 
         placeholder.markdown(
             full_response
@@ -937,7 +1602,6 @@ USER QUESTION:
 
         response_succeeded = True
 
-
     except Exception as error:
 
         placeholder.empty()
@@ -949,14 +1613,12 @@ USER QUESTION:
             f"{type(error).__name__}: {error}"
         )
 
-
     finally:
 
         st.markdown(
             close_assistant_row(),
             unsafe_allow_html=True,
         )
-
 
     # ========================================================
     # ERROR DISPLAY
@@ -981,21 +1643,38 @@ USER QUESTION:
             )
 
             st.write(
-                "**Prompt sent to AI:**"
+                "**Original question:**"
             )
 
             st.code(
                 prompt
             )
 
+            if question_type == "DOCUMENT":
+
+                st.write(
+                    "**Retrieval query:**"
+                )
+
+                st.code(
+                    retrieval_query
+                )
+
+                st.write(
+                    "**Retrieved context:**"
+                )
+
+                st.code(
+                    rag_context
+                )
+
             st.write(
-                "**Messages sent:**"
+                "**Messages sent to Groq:**"
             )
 
             st.json(
                 api_messages
             )
-
 
     # ========================================================
     # SAVE ASSISTANT RESPONSE
