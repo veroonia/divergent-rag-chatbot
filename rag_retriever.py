@@ -17,10 +17,7 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 # Retrieve a larger candidate pool first.
 RETRIEVAL_K = 20
 
-# Qdrant's similarity_search_with_score returns a SIMILARITY
-# score for cosine collections: higher = better match, roughly
-# in the 0-1 range. This is NOT a distance. A chunk must score
-# >= this to be considered.
+# A chunk must score >= this to be considered.
 SIMILARITY_THRESHOLD = 0.35
 
 # Maximum number of chunks eventually returned to the LLM.
