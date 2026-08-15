@@ -23,10 +23,7 @@ SIMILARITY_THRESHOLD = 0.35
 # Maximum number of chunks eventually returned to the LLM.
 FINAL_K = 5
 
-# Minimum combined score (semantic + lexical + concept) to keep
-# a chunk. Lower than before since raw semantic similarity for
-# short sentence-transformer embeddings on prose rarely exceeds
-# ~0.6-0.7 even for a strong match.
+# Minimum combined score (semantic + lexical + concept) to keep a chunk. 
 MIN_COMBINED_SCORE = 0.30
 
 
